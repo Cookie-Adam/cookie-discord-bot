@@ -1,6 +1,7 @@
 import os
 import random
 import datetime
+import sqlite3
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -18,6 +19,58 @@ intents.message_content = True  # required to read message text for commands
 intents.members = True  # required for on_member_join and role checks
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ---------------- Database setup (SQLite) ----------------
+db = sqlite3.connect("leveling.db")
+cursor = db.cursor()
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS levels (
+        user_id INTEGER PRIMARY KEY,
+        guild_id INTEGER,
+        xp INTEGER DEFAULT 0,
+        level INTEGER DEFAULT 1
+    )
+""")
+db.commit()
+
+# Cooldown tracker so users can't spam messages for XP (user_id -> last XP timestamp)
+xp_cooldowns = {}
+XP_COOLDOWN_SECONDS = 60
+XP_MIN = 15
+XP_MAX = 25
+
+
+def get_user(user_id: int, guild_id: int):
+    cursor.execute("SELECT xp, level FROM levels WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+    row = cursor.fetchone()
+    if row is None:
+        cursor.execute("INSERT INTO levels (user_id, guild_id, xp, level) VALUES (?, ?, 0, 1)", (user_id, guild_id))
+        db.commit()
+        return 0, 1
+    return row
+
+
+def xp_needed_for_level(level: int) -> int:
+    """XP required to go from this level to the next."""
+    return 5 * (level ** 2) + 50 * level + 100
+
+
+def add_xp(user_id: int, guild_id: int, amount: int):
+    xp, level = get_user(user_id, guild_id)
+    xp += amount
+    leveled_up = False
+
+    while xp >= xp_needed_for_level(level):
+        xp -= xp_needed_for_level(level)
+        level += 1
+        leveled_up = True
+
+    cursor.execute(
+        "UPDATE levels SET xp = ?, level = ? WHERE user_id = ? AND guild_id = ?",
+        (xp, level, user_id, guild_id)
+    )
+    db.commit()
+    return level, leveled_up
 
 
 def is_mod():
@@ -50,6 +103,30 @@ async def on_member_join(member):
         await channel.send(f"👋 Welcome to the server, {member.mention}!")
 
 
+@bot.event
+async def on_message(message):
+    """Awards XP for chatting, with a per-user cooldown to prevent spam farming."""
+    if message.author.bot or message.guild is None:
+        await bot.process_commands(message)
+        return
+
+    now = datetime.datetime.utcnow().timestamp()
+    key = (message.author.id, message.guild.id)
+    last_time = xp_cooldowns.get(key, 0)
+
+    if now - last_time >= XP_COOLDOWN_SECONDS:
+        xp_cooldowns[key] = now
+        amount = random.randint(XP_MIN, XP_MAX)
+        new_level, leveled_up = add_xp(message.author.id, message.guild.id, amount)
+
+        if leveled_up:
+            await message.channel.send(
+                f"🎉 {message.author.mention} leveled up to **Level {new_level}**!"
+            )
+
+    await bot.process_commands(message)
+
+
 # ---------------- Basic commands ----------------
 
 @bot.hybrid_command(description="Check if the bot is alive")
@@ -73,6 +150,44 @@ async def roll(ctx, sides: int = 6):
 async def avatar(ctx, member: discord.Member = None):
     member = member or ctx.author
     await ctx.send(member.display_avatar.url)
+
+
+# ---------------- Leveling commands ----------------
+
+@bot.hybrid_command(description="Check your (or someone else's) level and XP")
+async def rank(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    xp, level = get_user(member.id, ctx.guild.id)
+    needed = xp_needed_for_level(level)
+    await ctx.send(
+        f"📊 {member.mention} is **Level {level}** — {xp}/{needed} XP to next level"
+    )
+
+
+@bot.hybrid_command(description="Show the server's XP leaderboard")
+async def leaderboard(ctx):
+    cursor.execute(
+        "SELECT user_id, xp, level FROM levels WHERE guild_id = ? ORDER BY level DESC, xp DESC LIMIT 10",
+        (ctx.guild.id,)
+    )
+    rows = cursor.fetchall()
+
+    if not rows:
+        await ctx.send("No one has earned any XP yet — start chatting!")
+        return
+
+    lines = []
+    for i, (user_id, xp, level) in enumerate(rows, start=1):
+        member = ctx.guild.get_member(user_id)
+        name = member.display_name if member else f"Unknown User ({user_id})"
+        lines.append(f"**{i}.** {name} — Level {level} ({xp} XP)")
+
+    embed = discord.Embed(
+        title=f"🏆 {ctx.guild.name} Leaderboard",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    await ctx.send(embed=embed)
 
 
 # ---------------- Moderation commands (Owner/Admin roles only) ----------------
