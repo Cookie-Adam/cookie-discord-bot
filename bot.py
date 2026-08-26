@@ -34,6 +34,15 @@ cursor.execute("""
         level INTEGER DEFAULT 1
     )
 """)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS reaction_roles (
+        message_id INTEGER,
+        emoji TEXT,
+        role_id INTEGER,
+        guild_id INTEGER,
+        PRIMARY KEY (message_id, emoji)
+    )
+""")
 db.commit()
 
 xp_cooldowns = {}
@@ -82,7 +91,36 @@ def is_mod():
     return commands.check(predicate)
 
 
+# ---------------- Reaction role helpers ----------------
+
+def add_reaction_role(message_id: int, emoji: str, role_id: int, guild_id: int):
+    cursor.execute(
+        "INSERT OR REPLACE INTO reaction_roles (message_id, emoji, role_id, guild_id) VALUES (?, ?, ?, ?)",
+        (message_id, emoji, role_id, guild_id)
+    )
+    db.commit()
+
+
+def remove_reaction_role(message_id: int, emoji: str):
+    cursor.execute("DELETE FROM reaction_roles WHERE message_id = ? AND emoji = ?", (message_id, emoji))
+    db.commit()
+
+
+def get_reaction_role(message_id: int, emoji: str):
+    cursor.execute("SELECT role_id FROM reaction_roles WHERE message_id = ? AND emoji = ?", (message_id, emoji))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def get_reaction_roles_for_message(message_id: int):
+    cursor.execute("SELECT emoji, role_id FROM reaction_roles WHERE message_id = ?", (message_id,))
+    return cursor.fetchall()
+
+
 # ---------------- Music setup ----------------
+# player_client forces yt-dlp to pretend to be the YouTube Android/iOS app instead
+# of a browser, which usually avoids the "Sign in to confirm you're not a bot" block
+# that YouTube throws at requests coming from cloud/datacenter IPs (like Railway's).
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -90,6 +128,11 @@ YTDL_OPTS = {
     "quiet": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "ios"],
+        }
+    },
 }
 
 FFMPEG_OPTS = {
@@ -98,32 +141,23 @@ FFMPEG_OPTS = {
 }
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
-
-# guild_id -> list of dicts {"title": ..., "url": ...}
 song_queues = {}
-
 SPOTIFY_URL_PATTERN = re.compile(r"open\.spotify\.com/(track|album|playlist)/([A-Za-z0-9]+)")
 
 
 def resolve_query(query: str) -> str:
-    """
-    If given a Spotify link, we can't stream from Spotify directly (their API
-    doesn't allow bots to play audio). Instead, treat it as a search term by
-    stripping it down to a plain search query for YouTube.
-    """
     if SPOTIFY_URL_PATTERN.search(query):
-        return "spotify track (search fallback) " + query  # yt-dlp will still just search YouTube
+        return "spotify track (search fallback) " + query
     return query
 
 
 async def get_song_info(query: str):
-    """Runs yt-dlp in a background thread so it doesn't block the bot's event loop."""
     loop = asyncio.get_event_loop()
     query = resolve_query(query)
 
     def extract():
         info = ytdl.extract_info(query, download=False)
-        if "entries" in info:  # search results come back as a list
+        if "entries" in info:
             info = info["entries"][0]
         return info
 
@@ -134,13 +168,10 @@ async def get_song_info(query: str):
 async def play_next(ctx):
     guild_id = ctx.guild.id
     queue = song_queues.get(guild_id, [])
-
     if not queue:
         return
-
     song = queue.pop(0)
     voice_client = ctx.guild.voice_client
-
     source = discord.FFmpegPCMAudio(song["url"], **FFMPEG_OPTS)
 
     def after_playing(error):
@@ -192,6 +223,47 @@ async def on_message(message):
             await message.channel.send(f"🎉 {message.author.mention} leveled up to **Level {new_level}**!")
 
     await bot.process_commands(message)
+
+
+# ---------------- Reaction role events ----------------
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.member is None or payload.member.bot:
+        return
+    emoji_str = str(payload.emoji)
+    role_id = get_reaction_role(payload.message_id, emoji_str)
+    if role_id is None:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    role = guild.get_role(role_id)
+    if role is None:
+        return
+    try:
+        await payload.member.add_roles(role, reason="Reaction role")
+    except discord.Forbidden:
+        pass
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    emoji_str = str(payload.emoji)
+    role_id = get_reaction_role(payload.message_id, emoji_str)
+    if role_id is None:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    member = guild.get_member(payload.user_id)
+    if member is None or member.bot:
+        return
+    role = guild.get_role(role_id)
+    if role is None:
+        return
+    try:
+        await member.remove_roles(role, reason="Reaction role removed")
+    except discord.Forbidden:
+        pass
 
 
 # ---------------- Basic commands ----------------
@@ -291,7 +363,7 @@ async def skip(ctx):
     if voice_client is None or not voice_client.is_playing():
         await ctx.send("⚠️ Nothing is playing right now.")
         return
-    voice_client.stop()  # triggers the "after" callback, which plays the next song
+    voice_client.stop()
     await ctx.send("⏭️ Skipped.")
 
 
@@ -343,6 +415,61 @@ async def leave(ctx):
         await ctx.send("👋 Left the voice channel.")
     else:
         await ctx.send("⚠️ I'm not in a voice channel.")
+
+
+# ---------------- Reaction role commands (Owner/Admin roles only) ----------------
+
+@bot.hybrid_command(description="Set up a reaction role: react to a message with an emoji to get a role")
+@is_mod()
+async def reactionrole(ctx, message_id: str, emoji: str, role: discord.Role):
+    try:
+        message_id_int = int(message_id)
+    except ValueError:
+        await ctx.send("⚠️ That doesn't look like a valid message ID.")
+        return
+    try:
+        target_message = await ctx.channel.fetch_message(message_id_int)
+    except discord.NotFound:
+        await ctx.send("⚠️ Couldn't find a message with that ID in this channel.")
+        return
+    try:
+        await target_message.add_reaction(emoji)
+    except discord.HTTPException:
+        await ctx.send("⚠️ Couldn't react with that emoji — make sure it's a valid emoji the bot can use.")
+        return
+    add_reaction_role(message_id_int, emoji, role.id, ctx.guild.id)
+    await ctx.send(f"✅ Reacting with {emoji} on that message now grants **{role.name}**.")
+
+
+@bot.hybrid_command(description="Remove a reaction role from a message")
+@is_mod()
+async def removereactionrole(ctx, message_id: str, emoji: str):
+    try:
+        message_id_int = int(message_id)
+    except ValueError:
+        await ctx.send("⚠️ That doesn't look like a valid message ID.")
+        return
+    remove_reaction_role(message_id_int, emoji)
+    await ctx.send(f"✅ Removed the reaction role for {emoji} on that message.")
+
+
+@bot.hybrid_command(description="List all reaction roles set up on a message")
+async def listreactionroles(ctx, message_id: str):
+    try:
+        message_id_int = int(message_id)
+    except ValueError:
+        await ctx.send("⚠️ That doesn't look like a valid message ID.")
+        return
+    rows = get_reaction_roles_for_message(message_id_int)
+    if not rows:
+        await ctx.send("No reaction roles set up on that message.")
+        return
+    lines = []
+    for emoji, role_id in rows:
+        role = ctx.guild.get_role(role_id)
+        role_name = role.name if role else f"Unknown Role ({role_id})"
+        lines.append(f"{emoji} → {role_name}")
+    await ctx.send("**Reaction roles on that message:**\n" + "\n".join(lines))
 
 
 # ---------------- Moderation commands (Owner/Admin roles only) ----------------
@@ -419,6 +546,8 @@ async def on_command_error(ctx, error):
         await ctx.send(f"⚠️ Missing argument: `{error.param.name}`. Check command usage.")
     elif isinstance(error, commands.MemberNotFound):
         await ctx.send("⚠️ Couldn't find that member.")
+    elif isinstance(error, commands.RoleNotFound):
+        await ctx.send("⚠️ Couldn't find that role.")
     elif isinstance(error, commands.BadArgument):
         await ctx.send("⚠️ Invalid argument provided.")
     else:
