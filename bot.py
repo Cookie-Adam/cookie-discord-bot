@@ -35,7 +35,7 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-http_session: aiohttp.ClientSession = None  # created on startup
+http_session: aiohttp.ClientSession = None
 
 # ---------------- Database setup (SQLite) ----------------
 db = sqlite3.connect("leveling.db")
@@ -235,15 +235,8 @@ async def fetch_image_bytes(url: str) -> bytes:
 
 
 def generate_petpet_gif(avatar_bytes: bytes) -> io.BytesIO:
-    """
-    Builds a petpet-style GIF entirely in-process with Pillow (no external API
-    dependency). The avatar squishes vertically across frames while a simple
-    drawn hand descends onto it, mimicking the classic 'petpet' meme.
-    """
     size = 120
     avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((size, size))
-
-    # Squish factors per frame (0 = start, mid = most squished, end = back to normal)
     squish_factors = [1.0, 0.85, 0.7, 0.85, 1.0]
     frames = []
 
@@ -254,37 +247,27 @@ def generate_petpet_gif(avatar_bytes: bytes) -> io.BytesIO:
         y_offset = size - new_height
         frame.paste(squished_avatar, (0, y_offset), squished_avatar)
 
-        # Draw a simple stylized "hand" (rounded shape) descending onto the avatar
         draw = ImageDraw.Draw(frame)
         hand_y = int(y_offset * 0.6)
         hand_height = 26
         draw.ellipse(
             [size * 0.15, hand_y, size * 0.85, hand_y + hand_height],
-            fill=(255, 224, 189, 255),
-            outline=(120, 90, 60, 255),
-            width=3
+            fill=(255, 224, 189, 255), outline=(120, 90, 60, 255), width=3
         )
-        # little "fingers"
         for fx in (0.25, 0.45, 0.65):
             draw.ellipse(
                 [size * fx, hand_y - 8, size * fx + 14, hand_y + 12],
-                fill=(255, 224, 189, 255),
-                outline=(120, 90, 60, 255),
-                width=2
+                fill=(255, 224, 189, 255), outline=(120, 90, 60, 255), width=2
             )
         frames.append(frame.convert("RGB"))
 
     buffer = io.BytesIO()
-    frames[0].save(
-        buffer, format="GIF", save_all=True, append_images=frames[1:],
-        duration=90, loop=0
-    )
+    frames[0].save(buffer, format="GIF", save_all=True, append_images=frames[1:], duration=90, loop=0)
     buffer.seek(0)
     return buffer
 
 
 def draw_heart(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int, color):
-    """Draws a simple filled heart centered at (cx, cy)."""
     r = size // 2
     draw.ellipse([cx - r, cy - r, cx, cy + r // 2], fill=color)
     draw.ellipse([cx, cy - r, cx + r, cy + r // 2], fill=color)
@@ -292,15 +275,12 @@ def draw_heart(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int, color):
 
 
 def generate_ship_image(avatar1_bytes: bytes, avatar2_bytes: bytes) -> io.BytesIO:
-    """Combines two avatars side by side with a heart between them."""
     size = 200
-    padding = 20
     heart_zone = 80
     canvas_w = size * 2 + heart_zone
     canvas_h = size
 
     canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-
     avatar1 = Image.open(io.BytesIO(avatar1_bytes)).convert("RGBA").resize((size, size))
     avatar2 = Image.open(io.BytesIO(avatar2_bytes)).convert("RGBA").resize((size, size))
 
@@ -316,8 +296,30 @@ def generate_ship_image(avatar1_bytes: bytes, avatar2_bytes: bytes) -> io.BytesI
     return buffer
 
 
+def generate_l_stamp(avatar_bytes: bytes) -> io.BytesIO:
+    """Stamps a big red 'L' across someone's avatar."""
+    size = 200
+    avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((size, size))
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    canvas.paste(avatar, (0, 0), avatar)
+
+    # Darken the avatar slightly so the L pops
+    overlay = Image.new("RGBA", (size, size), (0, 0, 0, 90))
+    canvas = Image.alpha_composite(canvas, overlay)
+
+    draw = ImageDraw.Draw(canvas)
+    # Draw a bold "L" shape manually (thick lines) since we can't guarantee a font file exists
+    thickness = 22
+    draw.rectangle([40, 30, 40 + thickness, 170], fill=(220, 20, 20, 255))
+    draw.rectangle([40, 170 - thickness, 160, 170], fill=(220, 20, 20, 255))
+
+    buffer = io.BytesIO()
+    canvas.convert("RGB").save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
 def ship_percentage(id1: int, id2: int) -> int:
-    """Deterministic 'random' percentage so the same pair always gets the same result."""
     combined = f"{min(id1, id2)}-{max(id1, id2)}"
     digest = hashlib.sha256(combined.encode()).hexdigest()
     return int(digest, 16) % 101
@@ -342,6 +344,23 @@ ROAST_LINES = [
     "I've seen more effort in a school group project you didn't do.",
     "your aim is so bad, the enemy team feels safe.",
     "you're like a Wi-Fi signal — weak and constantly dropping.",
+    "you're the human equivalent of a buffering icon.",
+    "you have main character energy in a background character's storyline.",
+    "your rizz has a 404 error.",
+    "you peaked the day you joined this server, and it's been downhill since.",
+    "you're not lazy, you're just deeply committed to underachieving.",
+    "if disappointment was a person, they'd still be less disappointing than you.",
+    "you're the group project partner nobody wanted to text back.",
+    "your last brain cell is doing overtime and still failing.",
+    "you type like autocorrect gave up on you.",
+    "you're the reason instructions come with pictures.",
+    "even the NPCs have more personality than you.",
+    "your vibe check bounced.",
+    "you're proof that participation trophies went too far.",
+    "you're the human version of a plot hole.",
+    "you bring the same energy as a phone at 1% battery.",
+    "you're not built different, you're just built wrong.",
+    "you talk a big game for someone who folds under a group chat.",
 ]
 
 COMPLIMENT_LINES = [
@@ -362,9 +381,29 @@ FIGHT_MOVES = [
     "uses forbidden technique: rage quit threats",
 ]
 
+CLAPBACK_LINES = [
+    "your last argument just got dragged out back and put down.",
+    "that take just got clapped so hard the echo left the chat.",
+    "L taken, ratio'd, and the replay's already circulating.",
+    "cooked. seasoned. served. next.",
+    "that's not a comeback, that's a cry for help.",
+    "the disrespect just wrote itself and you handed over the pen.",
+    "somewhere a group chat just went silent out of respect.",
+]
+
+EXPOSED_CRIMES = [
+    "using the last of the hot water and lying about it",
+    "muting on voice chat but still typing like everyone can hear the keyboard",
+    "liking their own comment to make it look like someone agreed",
+    "claiming they '5-0'd the lobby' with zero screen recording evidence",
+    "still owing everyone money from three server events ago",
+    "changing their Discord name every 6 hours for attention",
+    "pretending to read the group chat then asking what happened",
+    "ghosting the group project then resurfacing for the credit",
+]
+
 
 async def fetch_reaction_gif(reaction: str) -> str:
-    """Uses the free, no-key otakugifs API for anime hug/kiss reaction gifs."""
     url = f"https://api.otakugifs.xyz/gif?reaction={reaction}"
     async with http_session.get(url) as resp:
         data = await resp.json()
@@ -601,10 +640,7 @@ async def pet(ctx, member: discord.Member = None):
         gif_buffer = await loop.run_in_executor(None, generate_petpet_gif, avatar_bytes)
         file = discord.File(gif_buffer, filename="pet.gif")
 
-        embed = discord.Embed(
-            description=f"{ctx.author.mention} is petting {member.mention} 🖐️",
-            color=COLOR_FUN
-        )
+        embed = discord.Embed(description=f"{ctx.author.mention} is petting {member.mention} 🖐️", color=COLOR_FUN)
         embed.set_image(url="attachment://pet.gif")
         await ctx.send(embed=embed, file=file)
     except Exception as e:
@@ -614,10 +650,7 @@ async def pet(ctx, member: discord.Member = None):
 
 @bot.hybrid_command(description="Hug someone")
 async def hug(ctx, member: discord.Member):
-    embed = discord.Embed(
-        description=f"{ctx.author.mention} hugs {member.mention} 🤗",
-        color=COLOR_FUN
-    )
+    embed = discord.Embed(description=f"{ctx.author.mention} hugs {member.mention} 🤗", color=COLOR_FUN)
     try:
         gif_url = await fetch_reaction_gif("hug")
         embed.set_image(url=gif_url)
@@ -628,10 +661,7 @@ async def hug(ctx, member: discord.Member):
 
 @bot.hybrid_command(description="Kiss someone")
 async def kiss(ctx, member: discord.Member):
-    embed = discord.Embed(
-        description=f"{ctx.author.mention} kisses {member.mention} 💋",
-        color=COLOR_FUN
-    )
+    embed = discord.Embed(description=f"{ctx.author.mention} kisses {member.mention} 💋", color=COLOR_FUN)
     try:
         gif_url = await fetch_reaction_gif("kiss")
         embed.set_image(url=gif_url)
@@ -640,16 +670,58 @@ async def kiss(ctx, member: discord.Member):
     await ctx.send(embed=embed)
 
 
-# ==================== WILDCARD COMMANDS ====================
+# ==================== SAVAGE / EDGY COMMANDS ====================
 
 @bot.hybrid_command(description="Roast someone (all in good fun)")
 async def roast(ctx, member: discord.Member):
     line = random.choice(ROAST_LINES)
+    embed = discord.Embed(description=f"{member.mention}, {line}", color=COLOR_DANGER)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Stamp a big L on someone")
+async def l(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    try:
+        avatar_bytes = await fetch_image_bytes(str(member.display_avatar.url))
+        loop = asyncio.get_event_loop()
+        image_buffer = await loop.run_in_executor(None, generate_l_stamp, avatar_bytes)
+        file = discord.File(image_buffer, filename="l.png")
+
+        embed = discord.Embed(description=f"{member.mention} just took the biggest L in server history.", color=COLOR_DANGER)
+        embed.set_image(url="attachment://l.png")
+        await ctx.send(embed=embed, file=file)
+    except Exception as e:
+        print(f"L stamp error: {e}")
+        await ctx.send(embed=simple_embed(f"{member.mention} just took the biggest L in server history. 🅻", COLOR_DANGER))
+
+
+@bot.hybrid_command(description="One-sided insult battle — someone's getting clapped")
+async def clapback(ctx, member1: discord.Member, member2: discord.Member):
+    winner = random.choice([member1, member2])
+    loser = member2 if winner == member1 else member1
+    line = random.choice(CLAPBACK_LINES)
+
     embed = discord.Embed(
-        description=f"{member.mention}, {line}",
+        title="🔥 CLAPBACK",
+        description=f"{winner.mention} just ended {loser.mention}'s whole career:\n\n*\"{line}\"*",
+        color=COLOR_DANGER
+    )
+    embed.set_thumbnail(url=loser.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Dramatically expose someone's 'crimes'")
+async def exposed(ctx, member: discord.Member):
+    crime = random.choice(EXPOSED_CRIMES)
+    embed = discord.Embed(
+        title="🚨 EXPOSED 🚨",
+        description=f"{member.mention} has been caught **{crime}**.\n\nThe court of public opinion has spoken.",
         color=COLOR_DANGER
     )
     embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text="This has been a public service announcement.")
     await ctx.send(embed=embed)
 
 
@@ -676,7 +748,7 @@ async def fight(ctx, member1: discord.Member, member2: discord.Member):
 @bot.hybrid_command(description="Rate how much one member simps for another")
 async def simprate(ctx, member1: discord.Member, member2: discord.Member = None):
     member2 = member2 or ctx.author
-    percent = ship_percentage(member1.id + 1, member2.id + 1)  # offset so it differs from /ship
+    percent = ship_percentage(member1.id + 1, member2.id + 1)
 
     if percent < 20:
         flavor = "Doesn't even know they exist. Zero simp detected."
