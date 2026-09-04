@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import math
 import random
 import asyncio
 import datetime
@@ -10,7 +11,7 @@ import discord
 import aiohttp
 from discord.ext import commands
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import yt_dlp
 import imageio_ffmpeg
 
@@ -26,10 +27,8 @@ if YOUTUBE_COOKIES:
 
 FFMPEG_EXECUTABLE = imageio_ffmpeg.get_ffmpeg_exe()
 
-# ---- Set the exact names of roles allowed to use moderation commands ----
 MOD_ROLE_NAMES = ["🌟 𝒪𝓌𝓃𝑒𝓇 ✨👑", "🌸 𝒜𝒹𝓂𝒾𝓃 🛠️💼"]
 
-# Set up intents (permissions for what the bot can "see")
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -37,7 +36,6 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 http_session: aiohttp.ClientSession = None
 
-# ---------------- Database setup (SQLite) ----------------
 db = sqlite3.connect("leveling.db")
 cursor = db.cursor()
 cursor.execute("""
@@ -57,6 +55,23 @@ cursor.execute("""
         PRIMARY KEY (message_id, emoji)
     )
 """)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS hug_counts (
+        user_id INTEGER,
+        guild_id INTEGER,
+        count INTEGER DEFAULT 0,
+        PRIMARY KEY (user_id, guild_id)
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS kiss_counts (
+        user1_id INTEGER,
+        user2_id INTEGER,
+        guild_id INTEGER,
+        count INTEGER DEFAULT 0,
+        PRIMARY KEY (user1_id, user2_id, guild_id)
+    )
+""")
 db.commit()
 
 xp_cooldowns = {}
@@ -64,7 +79,6 @@ XP_COOLDOWN_SECONDS = 60
 XP_MIN = 15
 XP_MAX = 25
 
-# ---------------- Color scheme ----------------
 COLOR_PRIMARY = discord.Color.from_rgb(255, 105, 180)
 COLOR_SUCCESS = discord.Color.from_rgb(87, 242, 135)
 COLOR_WARNING = discord.Color.from_rgb(255, 200, 60)
@@ -126,7 +140,55 @@ def is_mod():
     return commands.check(predicate)
 
 
-# ---------------- Reaction role helpers ----------------
+def is_mod_member(member: discord.Member) -> bool:
+    return any(role.name in MOD_ROLE_NAMES for role in member.roles)
+
+
+def increment_hug_count(user_id: int, guild_id: int) -> int:
+    cursor.execute("SELECT count FROM hug_counts WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+    row = cursor.fetchone()
+    new_count = (row[0] if row else 0) + 1
+    cursor.execute(
+        "INSERT OR REPLACE INTO hug_counts (user_id, guild_id, count) VALUES (?, ?, ?)",
+        (user_id, guild_id, new_count)
+    )
+    db.commit()
+    return new_count
+
+
+def get_hug_count(user_id: int, guild_id: int) -> int:
+    cursor.execute("SELECT count FROM hug_counts WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
+    row = cursor.fetchone()
+    return row[0] if row else 0
+
+
+def increment_kiss_count(id_a: int, id_b: int, guild_id: int) -> int:
+    u1, u2 = min(id_a, id_b), max(id_a, id_b)
+    cursor.execute("SELECT count FROM kiss_counts WHERE user1_id = ? AND user2_id = ? AND guild_id = ?", (u1, u2, guild_id))
+    row = cursor.fetchone()
+    new_count = (row[0] if row else 0) + 1
+    cursor.execute(
+        "INSERT OR REPLACE INTO kiss_counts (user1_id, user2_id, guild_id, count) VALUES (?, ?, ?, ?)",
+        (u1, u2, guild_id, new_count)
+    )
+    db.commit()
+    return new_count
+
+
+def get_kiss_count(id_a: int, id_b: int, guild_id: int) -> int:
+    u1, u2 = min(id_a, id_b), max(id_a, id_b)
+    cursor.execute("SELECT count FROM kiss_counts WHERE user1_id = ? AND user2_id = ? AND guild_id = ?", (u1, u2, guild_id))
+    row = cursor.fetchone()
+    return row[0] if row else 0
+
+
+def ordinal(n: int) -> str:
+    if 11 <= n % 100 <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
 
 def add_reaction_role(message_id: int, emoji: str, role_id: int, guild_id: int):
     cursor.execute(
@@ -151,8 +213,6 @@ def get_reaction_roles_for_message(message_id: int):
     cursor.execute("SELECT emoji, role_id FROM reaction_roles WHERE message_id = ?", (message_id,))
     return cursor.fetchall()
 
-
-# ---------------- Music setup ----------------
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -226,8 +286,6 @@ async def play_next(ctx):
     asyncio.create_task(ctx.send(embed=embed))
 
 
-# ==================== FUN / PERSONALITY HELPERS ====================
-
 async def fetch_image_bytes(url: str) -> bytes:
     async with http_session.get(url) as resp:
         resp.raise_for_status()
@@ -297,18 +355,15 @@ def generate_ship_image(avatar1_bytes: bytes, avatar2_bytes: bytes) -> io.BytesI
 
 
 def generate_l_stamp(avatar_bytes: bytes) -> io.BytesIO:
-    """Stamps a big red 'L' across someone's avatar."""
     size = 200
     avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((size, size))
     canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     canvas.paste(avatar, (0, 0), avatar)
 
-    # Darken the avatar slightly so the L pops
     overlay = Image.new("RGBA", (size, size), (0, 0, 0, 90))
     canvas = Image.alpha_composite(canvas, overlay)
 
     draw = ImageDraw.Draw(canvas)
-    # Draw a bold "L" shape manually (thick lines) since we can't guarantee a font file exists
     thickness = 22
     draw.rectangle([40, 30, 40 + thickness, 170], fill=(220, 20, 20, 255))
     draw.rectangle([40, 170 - thickness, 160, 170], fill=(220, 20, 20, 255))
@@ -410,7 +465,339 @@ async def fetch_reaction_gif(reaction: str) -> str:
         return data["url"]
 
 
-# ==================== EVENTS ====================
+MIN_PLAYERS = 4
+MAX_PLAYERS = 10
+SUBMIT_WINDOW_SECONDS = 30
+VOTE_WINDOW_SECONDS = 10
+SCENARIO_WRITE_TIMEOUT = 120
+
+
+class MemeGame:
+    def __init__(self, channel: discord.TextChannel, host: discord.Member):
+        self.channel = channel
+        self.host = host
+        self.players = [host]
+        self.state = "lobby"
+        self.lobby_message: discord.Message = None
+        self.turn_order = []
+        self.round_number = 0
+        self.current_writer = None
+        self.current_scenario = None
+        self.submissions = {}
+        self.total_scores = {}
+        self.total_likes = {}
+        self.best_overall = {"likes": -1, "bytes": None, "filename": None, "user_id": None, "scenario": None}
+        self.task: asyncio.Task = None
+
+
+active_games = {}
+lobby_watch = {}
+active_votes = {}
+
+VOTE_UP = "👍"
+VOTE_DOWN = "👎"
+JOIN_EMOJI = "🎮"
+
+
+def build_lobby_embed(game: MemeGame) -> discord.Embed:
+    names = "\n".join(f"• {p.mention}" for p in game.players) or "No one yet."
+    embed = discord.Embed(
+        title="🎮 Meme Game — Lobby Open!",
+        description=(
+            f"React with {JOIN_EMOJI} to join!\n"
+            f"Need **{MIN_PLAYERS}-{MAX_PLAYERS}** players.\n\n"
+            f"**Players ({len(game.players)}/{MAX_PLAYERS}):**\n{names}\n\n"
+            f"Host ({game.host.mention}) runs `!mgbegin` when ready."
+        ),
+        color=COLOR_FUN
+    )
+    return embed
+
+
+def make_collage(entries) -> io.BytesIO:
+    cell = 150
+    pad = 12
+    caption_h = 34
+    columns = min(5, max(1, len(entries)))
+    rows = math.ceil(len(entries) / columns)
+    width = columns * (cell + pad) + pad
+    height = rows * (cell + caption_h + pad) + pad
+
+    canvas = Image.new("RGB", (width, height), (32, 34, 40))
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+
+    for idx, (img_bytes, caption) in enumerate(entries):
+        col = idx % columns
+        row = idx // columns
+        x = pad + col * (cell + pad)
+        y = pad + row * (cell + caption_h + pad)
+        try:
+            thumb = Image.open(io.BytesIO(img_bytes)).convert("RGBA").resize((cell, cell))
+            canvas.paste(thumb, (x, y), thumb)
+        except Exception:
+            draw.rectangle([x, y, x + cell, y + cell], fill=(80, 80, 80))
+        draw.text((x, y + cell + 4), caption[:22], fill=(255, 255, 255), font=font)
+
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+async def run_memegame(game: MemeGame):
+    channel = game.channel
+    game.turn_order = random.sample(game.players, len(game.players))
+    total_rounds = len(game.turn_order)
+
+    for round_index, writer in enumerate(game.turn_order, start=1):
+        game.round_number = round_index
+        game.current_writer = writer
+        game.state = "writing"
+        game.submissions = {}
+
+        await channel.send(embed=discord.Embed(
+            title=f"📝 Round {round_index}/{total_rounds}",
+            description=f"{writer.mention}, it's your turn to write a scenario! Just type it in this channel (you have {SCENARIO_WRITE_TIMEOUT // 60} minutes).",
+            color=COLOR_FUN
+        ))
+
+        def check(m):
+            return m.author.id == writer.id and m.channel.id == channel.id
+
+        try:
+            msg = await bot.wait_for("message", check=check, timeout=SCENARIO_WRITE_TIMEOUT)
+            scenario = msg.content.strip() or "(blank scenario)"
+        except asyncio.TimeoutError:
+            await channel.send(embed=simple_embed(f"⌛ {writer.mention} took too long — round skipped.", COLOR_WARNING))
+            continue
+
+        game.current_scenario = scenario
+        await channel.send(embed=discord.Embed(title="🎭 Scenario", description=scenario, color=COLOR_FUN))
+
+        game.state = "submitting"
+        await channel.send(embed=simple_embed(
+            f"📸 Everyone has **{SUBMIT_WINDOW_SECONDS} seconds** to privately submit an image or gif using `/submit`!",
+            COLOR_MUSIC
+        ))
+        await asyncio.sleep(SUBMIT_WINDOW_SECONDS)
+        game.state = "revealing"
+
+        submitted_ids = list(game.submissions.keys())
+        random.shuffle(submitted_ids)
+
+        skipped = [p for p in game.players if p.id not in submitted_ids]
+        if skipped:
+            names = ", ".join(p.mention for p in skipped)
+            await channel.send(embed=simple_embed(f"⏭️ Skipped (no submission): {names}", COLOR_WARNING))
+
+        round_results = []
+
+        for idx, uid in enumerate(submitted_ids, start=1):
+            img_bytes, filename = game.submissions[uid]
+            safe_filename = filename if "." in filename else f"{filename}.png"
+            file = discord.File(io.BytesIO(img_bytes), filename=safe_filename)
+
+            embed = discord.Embed(
+                title=f"Submission #{idx}/{len(submitted_ids)}",
+                description=f"React {VOTE_UP} or {VOTE_DOWN}! You have {VOTE_WINDOW_SECONDS} seconds.",
+                color=COLOR_FUN
+            )
+            embed.set_image(url=f"attachment://{safe_filename}")
+            reveal_msg = await channel.send(embed=embed, file=file)
+            await reveal_msg.add_reaction(VOTE_UP)
+            await reveal_msg.add_reaction(VOTE_DOWN)
+
+            vote_data = {
+                "counts": {VOTE_UP: 0, VOTE_DOWN: 0},
+                "voters": set(),
+                "user_votes": {},
+                "event": asyncio.Event(),
+                "game": game,
+            }
+            active_votes[reveal_msg.id] = vote_data
+
+            async def timeout_setter(ev=vote_data["event"]):
+                await asyncio.sleep(VOTE_WINDOW_SECONDS)
+                if not ev.is_set():
+                    ev.set()
+
+            asyncio.create_task(timeout_setter())
+            await vote_data["event"].wait()
+            active_votes.pop(reveal_msg.id, None)
+
+            likes = vote_data["counts"][VOTE_UP]
+            dislikes = vote_data["counts"][VOTE_DOWN]
+            net = likes - dislikes
+
+            game.total_scores[uid] = game.total_scores.get(uid, 0) + net
+            game.total_likes[uid] = game.total_likes.get(uid, 0) + likes
+
+            if likes > game.best_overall["likes"]:
+                game.best_overall = {
+                    "likes": likes, "bytes": img_bytes, "filename": safe_filename,
+                    "user_id": uid, "scenario": scenario
+                }
+
+            round_results.append((uid, likes, dislikes, img_bytes, safe_filename))
+            await asyncio.sleep(1)
+
+        round_results.sort(key=lambda r: r[1] - r[2], reverse=True)
+        lines = []
+        collage_entries = []
+        for rank, (uid, likes, dislikes, img_bytes, filename) in enumerate(round_results, start=1):
+            member = channel.guild.get_member(uid)
+            name = member.display_name if member else f"User {uid}"
+            net = likes - dislikes
+            lines.append(f"**#{rank} {name}** — {VOTE_UP}{likes} {VOTE_DOWN}{dislikes} (net {net:+d})")
+            collage_entries.append((img_bytes, f"{name} ({likes}{VOTE_UP})"))
+
+        embed = discord.Embed(
+            title=f"📊 Round {round_index} Leaderboard",
+            description="\n".join(lines) if lines else "No submissions this round.",
+            color=COLOR_PRIMARY
+        )
+        if collage_entries:
+            loop = asyncio.get_event_loop()
+            collage_buf = await loop.run_in_executor(None, make_collage, collage_entries)
+            collage_file = discord.File(collage_buf, filename="round_leaderboard.png")
+            embed.set_image(url="attachment://round_leaderboard.png")
+            await channel.send(embed=embed, file=collage_file)
+        else:
+            await channel.send(embed=embed)
+
+    game.state = "finished"
+    final_sorted = sorted(game.total_scores.items(), key=lambda kv: kv[1], reverse=True)
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (uid, score) in enumerate(final_sorted, start=1):
+        member = channel.guild.get_member(uid)
+        name = member.display_name if member else f"User {uid}"
+        prefix = medals[i - 1] if i <= 3 else f"`#{i}`"
+        lines.append(f"{prefix} **{name}** — {score:+d} total points")
+
+    await channel.send(embed=discord.Embed(
+        title="🏁 Final Leaderboard",
+        description="\n".join(lines) if lines else "No scores recorded.",
+        color=COLOR_PRIMARY
+    ))
+
+    if game.best_overall["bytes"] is not None:
+        member = channel.guild.get_member(game.best_overall["user_id"])
+        name = member.display_name if member else "Unknown"
+        file = discord.File(io.BytesIO(game.best_overall["bytes"]), filename=game.best_overall["filename"])
+        embed = discord.Embed(
+            title="👑 Most Liked Entry of the Game",
+            description=f"By **{name}** — {game.best_overall['likes']} {VOTE_UP}\nScenario: *{game.best_overall['scenario']}*",
+            color=COLOR_FUN
+        )
+        embed.set_image(url=f"attachment://{game.best_overall['filename']}")
+        await channel.send(embed=embed, file=file)
+
+    active_games.pop(channel.id, None)
+
+
+@bot.hybrid_command(name="mgstart", description="Start a new Meme Game lobby in this channel")
+async def mgstart(ctx):
+    if ctx.channel.id in active_games:
+        await ctx.send(embed=simple_embed("⚠️ A game is already active in this channel.", COLOR_WARNING))
+        return
+
+    game = MemeGame(channel=ctx.channel, host=ctx.author)
+    active_games[ctx.channel.id] = game
+
+    embed = build_lobby_embed(game)
+    msg = await ctx.send(embed=embed)
+    await msg.add_reaction(JOIN_EMOJI)
+    game.lobby_message = msg
+    lobby_watch[msg.id] = game
+
+
+@bot.hybrid_command(name="mgbegin", description="Lock the lobby and start the Meme Game")
+async def mgbegin(ctx):
+    game = active_games.get(ctx.channel.id)
+    if game is None or game.state != "lobby":
+        await ctx.send(embed=simple_embed("⚠️ There's no open lobby in this channel.", COLOR_WARNING))
+        return
+    if ctx.author.id != game.host.id and not is_mod_member(ctx.author):
+        await ctx.send(embed=simple_embed("🚫 Only the host or a mod can start the game.", COLOR_DANGER))
+        return
+    if not (MIN_PLAYERS <= len(game.players) <= MAX_PLAYERS):
+        await ctx.send(embed=simple_embed(
+            f"⚠️ Need between {MIN_PLAYERS} and {MAX_PLAYERS} players — currently have {len(game.players)}.",
+            COLOR_WARNING
+        ))
+        return
+
+    lobby_watch.pop(game.lobby_message.id, None)
+    game.state = "starting"
+    names = ", ".join(p.mention for p in game.players)
+    await ctx.send(embed=discord.Embed(
+        title="🎬 Game Starting!",
+        description=f"Players: {names}\n\nGet ready — first scenario is coming up!",
+        color=COLOR_SUCCESS
+    ))
+    game.task = bot.loop.create_task(run_memegame(game))
+
+
+@bot.hybrid_command(name="mgcancel", description="Cancel the active Meme Game in this channel")
+async def mgcancel(ctx):
+    game = active_games.get(ctx.channel.id)
+    if game is None:
+        await ctx.send(embed=simple_embed("⚠️ No active game in this channel.", COLOR_WARNING))
+        return
+    if ctx.author.id != game.host.id and not is_mod_member(ctx.author):
+        await ctx.send(embed=simple_embed("🚫 Only the host or a mod can cancel the game.", COLOR_DANGER))
+        return
+
+    if game.task:
+        game.task.cancel()
+    if game.lobby_message:
+        lobby_watch.pop(game.lobby_message.id, None)
+    active_games.pop(ctx.channel.id, None)
+    await ctx.send(embed=simple_embed("🛑 Game cancelled.", COLOR_DANGER))
+
+
+@bot.hybrid_command(name="mgstatus", description="Show the current Meme Game status")
+async def mgstatus(ctx):
+    game = active_games.get(ctx.channel.id)
+    if game is None:
+        await ctx.send(embed=simple_embed("No active game in this channel.", COLOR_WARNING))
+        return
+    names = ", ".join(p.mention for p in game.players)
+    embed = discord.Embed(
+        title="🎮 Meme Game Status",
+        description=f"**State:** {game.state}\n**Round:** {game.round_number}\n**Players:** {names}",
+        color=COLOR_PRIMARY
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.tree.command(name="submit", description="Privately submit your image or gif for the current meme round")
+async def submit_command(interaction: discord.Interaction, attachment: discord.Attachment):
+    game = active_games.get(interaction.channel_id)
+    if game is None or game.state != "submitting":
+        await interaction.response.send_message("There's no active submission window right now.", ephemeral=True)
+        return
+    if interaction.user.id not in [p.id for p in game.players]:
+        await interaction.response.send_message("You're not in this game.", ephemeral=True)
+        return
+    if interaction.user.id in game.submissions:
+        await interaction.response.send_message("You've already submitted this round!", ephemeral=True)
+        return
+    if not (attachment.content_type and attachment.content_type.startswith("image")):
+        await interaction.response.send_message("Please attach an image or gif.", ephemeral=True)
+        return
+
+    try:
+        data = await attachment.read()
+    except Exception:
+        await interaction.response.send_message("Couldn't read that file — try again.", ephemeral=True)
+        return
+
+    game.submissions[interaction.user.id] = (data, attachment.filename)
+    await interaction.response.send_message("✅ Submission received! Wait for the reveal.", ephemeral=True)
+
 
 @bot.event
 async def on_ready():
@@ -469,44 +856,93 @@ async def on_message(message):
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.member is None or payload.member.bot:
+    if payload.user_id == bot.user.id:
         return
+
     emoji_str = str(payload.emoji)
+
     role_id = get_reaction_role(payload.message_id, emoji_str)
-    if role_id is None:
+    if role_id is not None and payload.member is not None and not payload.member.bot:
+        guild = bot.get_guild(payload.guild_id)
+        role = guild.get_role(role_id) if guild else None
+        if role is not None:
+            try:
+                await payload.member.add_roles(role, reason="Reaction role")
+            except discord.Forbidden:
+                pass
         return
-    guild = bot.get_guild(payload.guild_id)
-    role = guild.get_role(role_id)
-    if role is None:
+
+    if payload.message_id in lobby_watch and emoji_str == JOIN_EMOJI:
+        game = lobby_watch[payload.message_id]
+        if game.state == "lobby" and payload.member is not None and not payload.member.bot:
+            already_in = any(p.id == payload.member.id for p in game.players)
+            if not already_in and len(game.players) < MAX_PLAYERS:
+                game.players.append(payload.member)
+                try:
+                    await game.lobby_message.edit(embed=build_lobby_embed(game))
+                except discord.HTTPException:
+                    pass
+            elif not already_in:
+                try:
+                    await game.lobby_message.remove_reaction(JOIN_EMOJI, payload.member)
+                except discord.HTTPException:
+                    pass
         return
-    try:
-        await payload.member.add_roles(role, reason="Reaction role")
-    except discord.Forbidden:
-        pass
+
+    if payload.message_id in active_votes and emoji_str in (VOTE_UP, VOTE_DOWN):
+        vote_data = active_votes[payload.message_id]
+        game = vote_data["game"]
+        if payload.user_id not in [p.id for p in game.players]:
+            return
+        prior = vote_data["user_votes"].get(payload.user_id)
+        if prior == emoji_str:
+            return
+        if prior:
+            vote_data["counts"][prior] -= 1
+        vote_data["counts"][emoji_str] += 1
+        vote_data["user_votes"][payload.user_id] = emoji_str
+        vote_data["voters"].add(payload.user_id)
+        if len(vote_data["voters"]) >= len(game.players):
+            vote_data["event"].set()
 
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     emoji_str = str(payload.emoji)
+
     role_id = get_reaction_role(payload.message_id, emoji_str)
-    if role_id is None:
+    if role_id is not None:
+        guild = bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        member = guild.get_member(payload.user_id)
+        if member is None or member.bot:
+            return
+        role = guild.get_role(role_id)
+        if role is not None:
+            try:
+                await member.remove_roles(role, reason="Reaction role removed")
+            except discord.Forbidden:
+                pass
         return
-    guild = bot.get_guild(payload.guild_id)
-    if guild is None:
-        return
-    member = guild.get_member(payload.user_id)
-    if member is None or member.bot:
-        return
-    role = guild.get_role(role_id)
-    if role is None:
-        return
-    try:
-        await member.remove_roles(role, reason="Reaction role removed")
-    except discord.Forbidden:
-        pass
 
+    if payload.message_id in lobby_watch and emoji_str == JOIN_EMOJI:
+        game = lobby_watch[payload.message_id]
+        if game.state == "lobby":
+            game.players = [p for p in game.players if p.id != payload.user_id]
+            try:
+                await game.lobby_message.edit(embed=build_lobby_embed(game))
+            except discord.HTTPException:
+                pass
+        return
 
-# ==================== BASIC COMMANDS ====================
+    if payload.message_id in active_votes and emoji_str in (VOTE_UP, VOTE_DOWN):
+        vote_data = active_votes[payload.message_id]
+        if vote_data["user_votes"].get(payload.user_id) == emoji_str:
+            vote_data["counts"][emoji_str] -= 1
+            del vote_data["user_votes"][payload.user_id]
+            vote_data["voters"].discard(payload.user_id)
+
 
 @bot.hybrid_command(description="Check if the bot is alive")
 async def hello(ctx):
@@ -547,8 +983,6 @@ async def avatar(ctx, member: discord.Member = None):
     view.add_item(discord.ui.Button(label="⬇️ Download", url=member.display_avatar.url, style=discord.ButtonStyle.link))
     await ctx.send(embed=embed, view=view)
 
-
-# ==================== LEVELING COMMANDS ====================
 
 @bot.hybrid_command(description="Check your (or someone else's) level and XP")
 async def rank(ctx, member: discord.Member = None):
@@ -599,8 +1033,6 @@ async def leaderboard(ctx):
     await ctx.send(embed=embed)
 
 
-# ==================== FUN / LOVE COMMANDS ====================
-
 @bot.hybrid_command(description="Ship two members and see their compatibility")
 async def ship(ctx, member1: discord.Member, member2: discord.Member = None):
     member2 = member2 or ctx.author
@@ -650,27 +1082,52 @@ async def pet(ctx, member: discord.Member = None):
 
 @bot.hybrid_command(description="Hug someone")
 async def hug(ctx, member: discord.Member):
+    new_count = increment_hug_count(member.id, ctx.guild.id)
     embed = discord.Embed(description=f"{ctx.author.mention} hugs {member.mention} 🤗", color=COLOR_FUN)
     try:
         gif_url = await fetch_reaction_gif("hug")
         embed.set_image(url=gif_url)
     except Exception as e:
         print(f"Hug gif error: {e}")
+    embed.set_footer(text=f"This is the {ordinal(new_count)} time {member.display_name} has been hugged!")
     await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Kiss someone")
 async def kiss(ctx, member: discord.Member):
+    new_count = increment_kiss_count(ctx.author.id, member.id, ctx.guild.id)
     embed = discord.Embed(description=f"{ctx.author.mention} kisses {member.mention} 💋", color=COLOR_FUN)
     try:
         gif_url = await fetch_reaction_gif("kiss")
         embed.set_image(url=gif_url)
     except Exception as e:
         print(f"Kiss gif error: {e}")
+    embed.set_footer(text=f"{ctx.author.display_name} and {member.display_name} have kissed {new_count} time{'s' if new_count != 1 else ''}!")
     await ctx.send(embed=embed)
 
 
-# ==================== SAVAGE / EDGY COMMANDS ====================
+@bot.hybrid_command(description="Check how many times someone has been hugged")
+async def hugstats(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    count = get_hug_count(member.id, ctx.guild.id)
+    embed = discord.Embed(
+        description=f"🤗 {member.mention} has been hugged **{count}** time{'s' if count != 1 else ''}.",
+        color=COLOR_FUN
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Check how many times two members have kissed")
+async def kissstats(ctx, member1: discord.Member, member2: discord.Member = None):
+    member2 = member2 or ctx.author
+    count = get_kiss_count(member1.id, member2.id, ctx.guild.id)
+    embed = discord.Embed(
+        description=f"💋 {member1.mention} and {member2.mention} have kissed **{count}** time{'s' if count != 1 else ''}.",
+        color=COLOR_FUN
+    )
+    await ctx.send(embed=embed)
+
 
 @bot.hybrid_command(description="Roast someone (all in good fun)")
 async def roast(ctx, member: discord.Member):
@@ -680,8 +1137,8 @@ async def roast(ctx, member: discord.Member):
     await ctx.send(embed=embed)
 
 
-@bot.hybrid_command(description="Stamp a big L on someone")
-async def l(ctx, member: discord.Member = None):
+@bot.hybrid_command(name="l", description="Stamp a big L on someone")
+async def l_command(ctx, member: discord.Member = None):
     member = member or ctx.author
     try:
         avatar_bytes = await fetch_image_bytes(str(member.display_avatar.url))
@@ -767,8 +1224,6 @@ async def simprate(ctx, member1: discord.Member, member2: discord.Member = None)
     embed.set_thumbnail(url=member1.display_avatar.url)
     await ctx.send(embed=embed)
 
-
-# ==================== MUSIC COMMANDS ====================
 
 @bot.hybrid_command(description="Play a song from a YouTube link, Spotify link, or search term")
 async def play(ctx, *, query: str):
@@ -863,8 +1318,6 @@ async def leave(ctx):
         await ctx.send(embed=simple_embed("⚠️ I'm not in a voice channel.", COLOR_WARNING))
 
 
-# ==================== REACTION ROLE COMMANDS ====================
-
 @bot.hybrid_command(description="Set up a reaction role: react to a message with an emoji to get a role")
 @is_mod()
 async def reactionrole(ctx, message_id: str, emoji: str, role: discord.Role):
@@ -923,8 +1376,6 @@ async def listreactionroles(ctx, message_id: str):
     embed = discord.Embed(title="🎭 Reaction Roles", description="\n".join(lines), color=COLOR_PRIMARY)
     await ctx.send(embed=embed)
 
-
-# ==================== MODERATION COMMANDS ====================
 
 @bot.hybrid_command(description="Kick a member from the server")
 @is_mod()
@@ -1011,8 +1462,6 @@ async def warn(ctx, member: discord.Member, *, reason: str = "No reason provided
         await ctx.send(embed=embed)
 
 
-# ==================== ERROR HANDLING ====================
-
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CheckFailure):
@@ -1033,5 +1482,4 @@ async def on_command_error(ctx, error):
             pass
 
 
-# Run the bot
 bot.run(TOKEN)
