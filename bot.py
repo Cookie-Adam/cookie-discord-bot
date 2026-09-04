@@ -130,9 +130,11 @@ def get_reaction_roles_for_message(message_id: int):
 
 
 # ---------------- Music setup ----------------
-# Uses real YouTube cookies (from YOUTUBE_COOKIES env var) when available, which is
-# the most reliable way to avoid YouTube's "Sign in to confirm you're not a bot" block
-# on cloud/datacenter IPs. Falls back to android/ios client spoofing if no cookies set.
+# IMPORTANT: android/ios client spoofing and cookie authentication are mutually
+# exclusive in yt-dlp — the android/ios clients don't support cookies at all, so
+# using both together makes yt-dlp silently skip those clients and fail. We only
+# use the android/ios spoofing trick when we DON'T have cookies; when cookies are
+# present, we use the default (web) client, which does support them.
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -140,15 +142,17 @@ YTDL_OPTS = {
     "quiet": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android", "ios"],
-        }
-    },
 }
 
 if YOUTUBE_COOKIES:
     YTDL_OPTS["cookiefile"] = COOKIES_PATH
+    # No player_client override here — default web client supports cookies.
+else:
+    YTDL_OPTS["extractor_args"] = {
+        "youtube": {
+            "player_client": ["android", "ios"],
+        }
+    }
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
