@@ -15,14 +15,11 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
 
-# If cookies were provided via environment variable, write them to a local file
-# so yt-dlp can use them. This avoids ever committing the cookies file to Git.
 COOKIES_PATH = "cookies.txt"
 if YOUTUBE_COOKIES:
     with open(COOKIES_PATH, "w", encoding="utf-8") as f:
         f.write(YOUTUBE_COOKIES)
 
-# Bundled FFmpeg binary path (installed via the imageio-ffmpeg pip package).
 FFMPEG_EXECUTABLE = imageio_ffmpeg.get_ffmpeg_exe()
 
 # ---- Set the exact names of roles allowed to use moderation commands ----
@@ -62,6 +59,13 @@ XP_COOLDOWN_SECONDS = 60
 XP_MIN = 15
 XP_MAX = 25
 
+# ---------------- Color scheme (used across every embed) ----------------
+COLOR_PRIMARY = discord.Color.from_rgb(255, 105, 180)   # pink — general / neutral
+COLOR_SUCCESS = discord.Color.from_rgb(87, 242, 135)     # green — confirmations
+COLOR_WARNING = discord.Color.from_rgb(255, 200, 60)     # amber — warnings / input errors
+COLOR_DANGER = discord.Color.from_rgb(237, 66, 69)       # red — moderation actions
+COLOR_MUSIC = discord.Color.from_rgb(88, 101, 242)       # blurple — music
+
 
 def get_user(user_id: int, guild_id: int):
     cursor.execute("SELECT xp, level FROM levels WHERE user_id = ? AND guild_id = ?", (user_id, guild_id))
@@ -93,12 +97,26 @@ def add_xp(user_id: int, guild_id: int, amount: int):
     return level, leveled_up
 
 
+def make_progress_bar(current: int, total: int, length: int = 12) -> str:
+    filled = int(length * current / total) if total > 0 else 0
+    filled = max(0, min(filled, length))
+    return "■" * filled + "□" * (length - filled)
+
+
+def simple_embed(description: str, color=COLOR_PRIMARY, title: str = None):
+    """Shortcut for one-line status embeds used throughout the bot."""
+    embed = discord.Embed(description=description, color=color)
+    if title:
+        embed.title = title
+    return embed
+
+
 def is_mod():
     async def predicate(ctx):
         user_role_names = [role.name for role in ctx.author.roles]
         if any(name in user_role_names for name in MOD_ROLE_NAMES):
             return True
-        await ctx.send("🚫 You don't have permission to use this command.")
+        await ctx.send(embed=simple_embed("🚫 You don't have permission to use this command.", COLOR_DANGER))
         return False
     return commands.check(predicate)
 
@@ -130,11 +148,6 @@ def get_reaction_roles_for_message(message_id: int):
 
 
 # ---------------- Music setup ----------------
-# IMPORTANT: android/ios client spoofing and cookie authentication are mutually
-# exclusive in yt-dlp — the android/ios clients don't support cookies at all, so
-# using both together makes yt-dlp silently skip those clients and fail. We only
-# use the android/ios spoofing trick when we DON'T have cookies; when cookies are
-# present, we use the default (web) client, which does support them.
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -146,7 +159,6 @@ YTDL_OPTS = {
 
 if YOUTUBE_COOKIES:
     YTDL_OPTS["cookiefile"] = COOKIES_PATH
-    # No player_client override here — default web client supports cookies.
 else:
     YTDL_OPTS["extractor_args"] = {
         "youtube": {
@@ -203,7 +215,14 @@ async def play_next(ctx):
             print(f"Error advancing queue: {e}")
 
     voice_client.play(source, after=after_playing)
-    asyncio.create_task(ctx.send(f"🎶 Now playing: **{song['title']}**"))
+    embed = discord.Embed(
+        title="🎶 Now Playing",
+        description=f"**{song['title']}**",
+        color=COLOR_MUSIC
+    )
+    if song.get("webpage_url"):
+        embed.url = song["webpage_url"]
+    asyncio.create_task(ctx.send(embed=embed))
 
 
 @bot.event
@@ -223,7 +242,14 @@ async def on_ready():
 async def on_member_join(member):
     channel = discord.utils.get(member.guild.text_channels, name="general")
     if channel:
-        await channel.send(f"👋 Welcome to the server, {member.mention}!")
+        embed = discord.Embed(
+            title="👋 Welcome!",
+            description=f"Welcome to the server, {member.mention}! We're glad you're here.",
+            color=COLOR_SUCCESS
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"Member #{member.guild.member_count}")
+        await channel.send(embed=embed)
 
 
 @bot.event
@@ -241,7 +267,12 @@ async def on_message(message):
         amount = random.randint(XP_MIN, XP_MAX)
         new_level, leveled_up = add_xp(message.author.id, message.guild.id, amount)
         if leveled_up:
-            await message.channel.send(f"🎉 {message.author.mention} leveled up to **Level {new_level}**!")
+            embed = discord.Embed(
+                description=f"🎉 {message.author.mention} leveled up to **Level {new_level}**!",
+                color=COLOR_PRIMARY
+            )
+            embed.set_thumbnail(url=message.author.display_avatar.url)
+            await message.channel.send(embed=embed)
 
     await bot.process_commands(message)
 
@@ -291,25 +322,44 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 
 @bot.hybrid_command(description="Check if the bot is alive")
 async def hello(ctx):
-    await ctx.send(f"Hey {ctx.author.mention}! I'm alive 🎉")
+    embed = discord.Embed(
+        description=f"Hey {ctx.author.mention}! I'm alive 🎉",
+        color=COLOR_PRIMARY
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Check the bot's latency")
 async def ping(ctx):
     latency_ms = round(bot.latency * 1000)
-    await ctx.send(f"🏓 Pong! {latency_ms}ms")
+    embed = discord.Embed(
+        title="🏓 Pong!",
+        description=f"Latency: **{latency_ms}ms**",
+        color=COLOR_PRIMARY
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Roll a dice")
 async def roll(ctx, sides: int = 6):
     result = random.randint(1, sides)
-    await ctx.send(f"🎲 You rolled a {result} (out of {sides})")
+    embed = discord.Embed(
+        title="🎲 Dice Roll",
+        description=f"{ctx.author.mention} rolled a **{result}** (out of {sides})",
+        color=COLOR_PRIMARY
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Show a user's avatar")
 async def avatar(ctx, member: discord.Member = None):
     member = member or ctx.author
-    await ctx.send(member.display_avatar.url)
+    embed = discord.Embed(
+        title=f"{member.display_name}'s Avatar",
+        color=member.color if member.color.value != 0 else COLOR_PRIMARY
+    )
+    embed.set_image(url=member.display_avatar.url)
+    await ctx.send(embed=embed)
 
 
 # ---------------- Leveling commands ----------------
@@ -319,7 +369,18 @@ async def rank(ctx, member: discord.Member = None):
     member = member or ctx.author
     xp, level = get_user(member.id, ctx.guild.id)
     needed = xp_needed_for_level(level)
-    await ctx.send(f"📊 {member.mention} is **Level {level}** — {xp}/{needed} XP to next level")
+    bar = make_progress_bar(xp, needed)
+    percent = int((xp / needed) * 100) if needed > 0 else 0
+
+    embed = discord.Embed(
+        title=f"📊 {member.display_name}'s Rank",
+        color=member.color if member.color.value != 0 else COLOR_PRIMARY
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Level", value=f"**{level}**", inline=True)
+    embed.add_field(name="XP", value=f"**{xp} / {needed}**", inline=True)
+    embed.add_field(name="Progress", value=f"{bar}  {percent}%", inline=False)
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Show the server's XP leaderboard")
@@ -330,18 +391,29 @@ async def leaderboard(ctx):
     )
     rows = cursor.fetchall()
     if not rows:
-        await ctx.send("No one has earned any XP yet — start chatting!")
+        await ctx.send(embed=simple_embed("No one has earned any XP yet — start chatting!", COLOR_WARNING))
         return
+
+    medals = ["🥇", "🥈", "🥉"]
     lines = []
+    top_member = None
+
     for i, (user_id, xp, level) in enumerate(rows, start=1):
         member = ctx.guild.get_member(user_id)
         name = member.display_name if member else f"Unknown User ({user_id})"
-        lines.append(f"**{i}.** {name} — Level {level} ({xp} XP)")
+        if i == 1:
+            top_member = member
+        prefix = medals[i - 1] if i <= 3 else f"`#{i}`"
+        lines.append(f"{prefix}  **{name}** — Level {level} ({xp} XP)")
+
     embed = discord.Embed(
         title=f"🏆 {ctx.guild.name} Leaderboard",
         description="\n".join(lines),
-        color=discord.Color.gold()
+        color=COLOR_PRIMARY
     )
+    if top_member:
+        embed.set_thumbnail(url=top_member.display_avatar.url)
+    embed.set_footer(text=f"Top {len(rows)} member{'s' if len(rows) != 1 else ''} by level")
     await ctx.send(embed=embed)
 
 
@@ -350,7 +422,7 @@ async def leaderboard(ctx):
 @bot.hybrid_command(description="Play a song from a YouTube link, Spotify link, or search term")
 async def play(ctx, *, query: str):
     if ctx.author.voice is None:
-        await ctx.send("⚠️ You need to be in a voice channel first.")
+        await ctx.send(embed=simple_embed("⚠️ You need to be in a voice channel first.", COLOR_WARNING))
         return
 
     voice_channel = ctx.author.voice.channel
@@ -361,12 +433,12 @@ async def play(ctx, *, query: str):
     elif voice_client.channel != voice_channel:
         await voice_client.move_to(voice_channel)
 
-    await ctx.send(f"🔎 Searching for: `{query}`...")
+    await ctx.send(embed=simple_embed(f"🔎 Searching for: `{query}`...", COLOR_MUSIC))
 
     try:
         song = await get_song_info(query)
     except Exception as e:
-        await ctx.send(f"⚠️ Couldn't find or play that: {e}")
+        await ctx.send(embed=simple_embed(f"⚠️ Couldn't find or play that: {e}", COLOR_DANGER))
         return
 
     guild_id = ctx.guild.id
@@ -375,17 +447,22 @@ async def play(ctx, *, query: str):
     if not voice_client.is_playing() and not voice_client.is_paused():
         await play_next(ctx)
     else:
-        await ctx.send(f"➕ Added to queue: **{song['title']}**")
+        embed = discord.Embed(
+            title="➕ Added to Queue",
+            description=f"**{song['title']}**",
+            color=COLOR_MUSIC
+        )
+        await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Skip the current song")
 async def skip(ctx):
     voice_client = ctx.guild.voice_client
     if voice_client is None or not voice_client.is_playing():
-        await ctx.send("⚠️ Nothing is playing right now.")
+        await ctx.send(embed=simple_embed("⚠️ Nothing is playing right now.", COLOR_WARNING))
         return
     voice_client.stop()
-    await ctx.send("⏭️ Skipped.")
+    await ctx.send(embed=simple_embed("⏭️ Skipped.", COLOR_MUSIC))
 
 
 @bot.hybrid_command(description="Pause the current song")
@@ -393,9 +470,9 @@ async def pause(ctx):
     voice_client = ctx.guild.voice_client
     if voice_client and voice_client.is_playing():
         voice_client.pause()
-        await ctx.send("⏸️ Paused.")
+        await ctx.send(embed=simple_embed("⏸️ Paused.", COLOR_MUSIC))
     else:
-        await ctx.send("⚠️ Nothing is playing.")
+        await ctx.send(embed=simple_embed("⚠️ Nothing is playing.", COLOR_WARNING))
 
 
 @bot.hybrid_command(description="Resume the paused song")
@@ -403,9 +480,9 @@ async def resume(ctx):
     voice_client = ctx.guild.voice_client
     if voice_client and voice_client.is_paused():
         voice_client.resume()
-        await ctx.send("▶️ Resumed.")
+        await ctx.send(embed=simple_embed("▶️ Resumed.", COLOR_MUSIC))
     else:
-        await ctx.send("⚠️ Nothing is paused.")
+        await ctx.send(embed=simple_embed("⚠️ Nothing is paused.", COLOR_WARNING))
 
 
 @bot.hybrid_command(description="Stop playback and clear the queue")
@@ -414,17 +491,22 @@ async def stop(ctx):
     song_queues[ctx.guild.id] = []
     if voice_client:
         voice_client.stop()
-    await ctx.send("⏹️ Stopped and cleared the queue.")
+    await ctx.send(embed=simple_embed("⏹️ Stopped and cleared the queue.", COLOR_MUSIC))
 
 
 @bot.hybrid_command(description="Show the current song queue")
 async def queue(ctx):
     songs = song_queues.get(ctx.guild.id, [])
     if not songs:
-        await ctx.send("The queue is empty.")
+        await ctx.send(embed=simple_embed("The queue is empty.", COLOR_WARNING))
         return
     lines = [f"{i+1}. {s['title']}" for i, s in enumerate(songs)]
-    await ctx.send("📜 **Queue:**\n" + "\n".join(lines))
+    embed = discord.Embed(
+        title="📜 Song Queue",
+        description="\n".join(lines),
+        color=COLOR_MUSIC
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Make the bot leave the voice channel")
@@ -433,9 +515,9 @@ async def leave(ctx):
     if voice_client:
         song_queues[ctx.guild.id] = []
         await voice_client.disconnect()
-        await ctx.send("👋 Left the voice channel.")
+        await ctx.send(embed=simple_embed("👋 Left the voice channel.", COLOR_MUSIC))
     else:
-        await ctx.send("⚠️ I'm not in a voice channel.")
+        await ctx.send(embed=simple_embed("⚠️ I'm not in a voice channel.", COLOR_WARNING))
 
 
 # ---------------- Reaction role commands (Owner/Admin roles only) ----------------
@@ -446,20 +528,25 @@ async def reactionrole(ctx, message_id: str, emoji: str, role: discord.Role):
     try:
         message_id_int = int(message_id)
     except ValueError:
-        await ctx.send("⚠️ That doesn't look like a valid message ID.")
+        await ctx.send(embed=simple_embed("⚠️ That doesn't look like a valid message ID.", COLOR_WARNING))
         return
     try:
         target_message = await ctx.channel.fetch_message(message_id_int)
     except discord.NotFound:
-        await ctx.send("⚠️ Couldn't find a message with that ID in this channel.")
+        await ctx.send(embed=simple_embed("⚠️ Couldn't find a message with that ID in this channel.", COLOR_WARNING))
         return
     try:
         await target_message.add_reaction(emoji)
     except discord.HTTPException:
-        await ctx.send("⚠️ Couldn't react with that emoji — make sure it's a valid emoji the bot can use.")
+        await ctx.send(embed=simple_embed("⚠️ Couldn't react with that emoji — make sure it's a valid emoji the bot can use.", COLOR_WARNING))
         return
     add_reaction_role(message_id_int, emoji, role.id, ctx.guild.id)
-    await ctx.send(f"✅ Reacting with {emoji} on that message now grants **{role.name}**.")
+    embed = discord.Embed(
+        title="✅ Reaction Role Set",
+        description=f"Reacting with {emoji} on that message now grants **{role.name}**.",
+        color=COLOR_SUCCESS
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Remove a reaction role from a message")
@@ -468,10 +555,10 @@ async def removereactionrole(ctx, message_id: str, emoji: str):
     try:
         message_id_int = int(message_id)
     except ValueError:
-        await ctx.send("⚠️ That doesn't look like a valid message ID.")
+        await ctx.send(embed=simple_embed("⚠️ That doesn't look like a valid message ID.", COLOR_WARNING))
         return
     remove_reaction_role(message_id_int, emoji)
-    await ctx.send(f"✅ Removed the reaction role for {emoji} on that message.")
+    await ctx.send(embed=simple_embed(f"✅ Removed the reaction role for {emoji} on that message.", COLOR_SUCCESS))
 
 
 @bot.hybrid_command(description="List all reaction roles set up on a message")
@@ -479,18 +566,23 @@ async def listreactionroles(ctx, message_id: str):
     try:
         message_id_int = int(message_id)
     except ValueError:
-        await ctx.send("⚠️ That doesn't look like a valid message ID.")
+        await ctx.send(embed=simple_embed("⚠️ That doesn't look like a valid message ID.", COLOR_WARNING))
         return
     rows = get_reaction_roles_for_message(message_id_int)
     if not rows:
-        await ctx.send("No reaction roles set up on that message.")
+        await ctx.send(embed=simple_embed("No reaction roles set up on that message.", COLOR_WARNING))
         return
     lines = []
     for emoji, role_id in rows:
         role = ctx.guild.get_role(role_id)
         role_name = role.name if role else f"Unknown Role ({role_id})"
         lines.append(f"{emoji} → {role_name}")
-    await ctx.send("**Reaction roles on that message:**\n" + "\n".join(lines))
+    embed = discord.Embed(
+        title="🎭 Reaction Roles",
+        description="\n".join(lines),
+        color=COLOR_PRIMARY
+    )
+    await ctx.send(embed=embed)
 
 
 # ---------------- Moderation commands (Owner/Admin roles only) ----------------
@@ -499,14 +591,22 @@ async def listreactionroles(ctx, message_id: str):
 @is_mod()
 async def kick(ctx, member: discord.Member, *, reason: str = "No reason provided"):
     await member.kick(reason=reason)
-    await ctx.send(f"👢 {member.mention} was kicked. Reason: {reason}")
+    embed = discord.Embed(title="👢 Member Kicked", color=COLOR_DANGER)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Member", value=member.mention, inline=True)
+    embed.add_field(name="Reason", value=reason, inline=True)
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Ban a member from the server")
 @is_mod()
 async def ban(ctx, member: discord.Member, *, reason: str = "No reason provided"):
     await member.ban(reason=reason)
-    await ctx.send(f"🔨 {member.mention} was banned. Reason: {reason}")
+    embed = discord.Embed(title="🔨 Member Banned", color=COLOR_DANGER)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Member", value=member.mention, inline=True)
+    embed.add_field(name="Reason", value=reason, inline=True)
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Unban a member by username or ID")
@@ -518,10 +618,15 @@ async def unban(ctx, *, user_input: str):
     else:
         target = discord.utils.find(lambda e: str(e.user) == user_input, banned_users)
     if target is None:
-        await ctx.send("⚠️ Couldn't find that user in the ban list.")
+        await ctx.send(embed=simple_embed("⚠️ Couldn't find that user in the ban list.", COLOR_WARNING))
         return
     await ctx.guild.unban(target.user)
-    await ctx.send(f"✅ Unbanned {target.user}")
+    embed = discord.Embed(
+        title="✅ Member Unbanned",
+        description=str(target.user),
+        color=COLOR_SUCCESS
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Timeout (mute) a member for N minutes")
@@ -529,32 +634,56 @@ async def unban(ctx, *, user_input: str):
 async def mute(ctx, member: discord.Member, minutes: int, *, reason: str = "No reason provided"):
     duration = datetime.timedelta(minutes=minutes)
     await member.timeout(duration, reason=reason)
-    await ctx.send(f"🔇 {member.mention} was muted for {minutes} minute(s). Reason: {reason}")
+    embed = discord.Embed(title="🔇 Member Muted", color=COLOR_DANGER)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Member", value=member.mention, inline=True)
+    embed.add_field(name="Duration", value=f"{minutes} minute(s)", inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Remove a timeout from a member")
 @is_mod()
 async def unmute(ctx, member: discord.Member):
     await member.timeout(None)
-    await ctx.send(f"🔊 {member.mention} was unmuted.")
+    embed = discord.Embed(
+        title="🔊 Member Unmuted",
+        description=member.mention,
+        color=COLOR_SUCCESS
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    await ctx.send(embed=embed)
 
 
 @bot.hybrid_command(description="Delete the last N messages in this channel")
 @is_mod()
 async def clear(ctx, amount: int = 5):
     deleted = await ctx.channel.purge(limit=amount + 1)
-    msg = await ctx.send(f"🧹 Deleted {len(deleted) - 1} message(s).")
+    msg = await ctx.send(embed=simple_embed(f"🧹 Deleted {len(deleted) - 1} message(s).", COLOR_SUCCESS))
     await msg.delete(delay=3)
 
 
 @bot.hybrid_command(description="Send a warning DM to a member")
 @is_mod()
 async def warn(ctx, member: discord.Member, *, reason: str = "No reason provided"):
+    dm_embed = discord.Embed(
+        title="⚠️ You have been warned",
+        description=f"In **{ctx.guild.name}**",
+        color=COLOR_WARNING
+    )
+    dm_embed.add_field(name="Reason", value=reason)
+
     try:
-        await member.send(f"⚠️ You have been warned in **{ctx.guild.name}**. Reason: {reason}")
-        await ctx.send(f"✅ Warned {member.mention}.")
+        await member.send(embed=dm_embed)
+        await ctx.send(embed=simple_embed(f"✅ Warned {member.mention}.", COLOR_SUCCESS))
     except discord.Forbidden:
-        await ctx.send(f"⚠️ Could not DM {member.mention} (they may have DMs disabled). Warning logged here instead: {reason}")
+        embed = discord.Embed(
+            title="⚠️ Warning Logged (DM Failed)",
+            description=f"Could not DM {member.mention} — they may have DMs disabled.",
+            color=COLOR_WARNING
+        )
+        embed.add_field(name="Reason", value=reason)
+        await ctx.send(embed=embed)
 
 
 # ---------------- Error handling ----------------
@@ -564,17 +693,17 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CheckFailure):
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"⚠️ Missing argument: `{error.param.name}`. Check command usage.")
+        await ctx.send(embed=simple_embed(f"⚠️ Missing argument: `{error.param.name}`. Check command usage.", COLOR_WARNING))
     elif isinstance(error, commands.MemberNotFound):
-        await ctx.send("⚠️ Couldn't find that member.")
+        await ctx.send(embed=simple_embed("⚠️ Couldn't find that member.", COLOR_WARNING))
     elif isinstance(error, commands.RoleNotFound):
-        await ctx.send("⚠️ Couldn't find that role.")
+        await ctx.send(embed=simple_embed("⚠️ Couldn't find that role.", COLOR_WARNING))
     elif isinstance(error, commands.BadArgument):
-        await ctx.send("⚠️ Invalid argument provided.")
+        await ctx.send(embed=simple_embed("⚠️ Invalid argument provided.", COLOR_WARNING))
     else:
         print(f"Unhandled error: {error}")
         try:
-            await ctx.send("⚠️ Something went wrong running that command.")
+            await ctx.send(embed=simple_embed("⚠️ Something went wrong running that command.", COLOR_DANGER))
         except discord.NotFound:
             pass
 
