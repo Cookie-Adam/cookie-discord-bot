@@ -1,12 +1,16 @@
 import os
 import re
+import io
 import random
 import asyncio
 import datetime
+import hashlib
 import sqlite3
 import discord
+import aiohttp
 from discord.ext import commands
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw
 import yt_dlp
 import imageio_ffmpeg
 
@@ -31,6 +35,7 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+http_session: aiohttp.ClientSession = None  # created on startup
 
 # ---------------- Database setup (SQLite) ----------------
 db = sqlite3.connect("leveling.db")
@@ -59,12 +64,13 @@ XP_COOLDOWN_SECONDS = 60
 XP_MIN = 15
 XP_MAX = 25
 
-# ---------------- Color scheme (used across every embed) ----------------
-COLOR_PRIMARY = discord.Color.from_rgb(255, 105, 180)   # pink — general / neutral
-COLOR_SUCCESS = discord.Color.from_rgb(87, 242, 135)     # green — confirmations
-COLOR_WARNING = discord.Color.from_rgb(255, 200, 60)     # amber — warnings / input errors
-COLOR_DANGER = discord.Color.from_rgb(237, 66, 69)       # red — moderation actions
-COLOR_MUSIC = discord.Color.from_rgb(88, 101, 242)       # blurple — music
+# ---------------- Color scheme ----------------
+COLOR_PRIMARY = discord.Color.from_rgb(255, 105, 180)
+COLOR_SUCCESS = discord.Color.from_rgb(87, 242, 135)
+COLOR_WARNING = discord.Color.from_rgb(255, 200, 60)
+COLOR_DANGER = discord.Color.from_rgb(237, 66, 69)
+COLOR_MUSIC = discord.Color.from_rgb(88, 101, 242)
+COLOR_FUN = discord.Color.from_rgb(255, 71, 141)
 
 
 def get_user(user_id: int, guild_id: int):
@@ -104,7 +110,6 @@ def make_progress_bar(current: int, total: int, length: int = 12) -> str:
 
 
 def simple_embed(description: str, color=COLOR_PRIMARY, title: str = None):
-    """Shortcut for one-line status embeds used throughout the bot."""
     embed = discord.Embed(description=description, color=color)
     if title:
         embed.title = title
@@ -215,18 +220,164 @@ async def play_next(ctx):
             print(f"Error advancing queue: {e}")
 
     voice_client.play(source, after=after_playing)
-    embed = discord.Embed(
-        title="🎶 Now Playing",
-        description=f"**{song['title']}**",
-        color=COLOR_MUSIC
-    )
+    embed = discord.Embed(title="🎶 Now Playing", description=f"**{song['title']}**", color=COLOR_MUSIC)
     if song.get("webpage_url"):
         embed.url = song["webpage_url"]
     asyncio.create_task(ctx.send(embed=embed))
 
 
+# ==================== FUN / PERSONALITY HELPERS ====================
+
+async def fetch_image_bytes(url: str) -> bytes:
+    async with http_session.get(url) as resp:
+        resp.raise_for_status()
+        return await resp.read()
+
+
+def generate_petpet_gif(avatar_bytes: bytes) -> io.BytesIO:
+    """
+    Builds a petpet-style GIF entirely in-process with Pillow (no external API
+    dependency). The avatar squishes vertically across frames while a simple
+    drawn hand descends onto it, mimicking the classic 'petpet' meme.
+    """
+    size = 120
+    avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((size, size))
+
+    # Squish factors per frame (0 = start, mid = most squished, end = back to normal)
+    squish_factors = [1.0, 0.85, 0.7, 0.85, 1.0]
+    frames = []
+
+    for factor in squish_factors:
+        frame = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        new_height = int(size * factor)
+        squished_avatar = avatar.resize((size, new_height))
+        y_offset = size - new_height
+        frame.paste(squished_avatar, (0, y_offset), squished_avatar)
+
+        # Draw a simple stylized "hand" (rounded shape) descending onto the avatar
+        draw = ImageDraw.Draw(frame)
+        hand_y = int(y_offset * 0.6)
+        hand_height = 26
+        draw.ellipse(
+            [size * 0.15, hand_y, size * 0.85, hand_y + hand_height],
+            fill=(255, 224, 189, 255),
+            outline=(120, 90, 60, 255),
+            width=3
+        )
+        # little "fingers"
+        for fx in (0.25, 0.45, 0.65):
+            draw.ellipse(
+                [size * fx, hand_y - 8, size * fx + 14, hand_y + 12],
+                fill=(255, 224, 189, 255),
+                outline=(120, 90, 60, 255),
+                width=2
+            )
+        frames.append(frame.convert("RGB"))
+
+    buffer = io.BytesIO()
+    frames[0].save(
+        buffer, format="GIF", save_all=True, append_images=frames[1:],
+        duration=90, loop=0
+    )
+    buffer.seek(0)
+    return buffer
+
+
+def draw_heart(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int, color):
+    """Draws a simple filled heart centered at (cx, cy)."""
+    r = size // 2
+    draw.ellipse([cx - r, cy - r, cx, cy + r // 2], fill=color)
+    draw.ellipse([cx, cy - r, cx + r, cy + r // 2], fill=color)
+    draw.polygon([(cx - r, cy + r // 4), (cx + r, cy + r // 4), (cx, cy + r + r)], fill=color)
+
+
+def generate_ship_image(avatar1_bytes: bytes, avatar2_bytes: bytes) -> io.BytesIO:
+    """Combines two avatars side by side with a heart between them."""
+    size = 200
+    padding = 20
+    heart_zone = 80
+    canvas_w = size * 2 + heart_zone
+    canvas_h = size
+
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+
+    avatar1 = Image.open(io.BytesIO(avatar1_bytes)).convert("RGBA").resize((size, size))
+    avatar2 = Image.open(io.BytesIO(avatar2_bytes)).convert("RGBA").resize((size, size))
+
+    canvas.paste(avatar1, (0, 0), avatar1)
+    canvas.paste(avatar2, (size + heart_zone, 0), avatar2)
+
+    draw = ImageDraw.Draw(canvas)
+    draw_heart(draw, size + heart_zone // 2, canvas_h // 2, 50, (255, 71, 141, 255))
+
+    buffer = io.BytesIO()
+    canvas.convert("RGB").save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+def ship_percentage(id1: int, id2: int) -> int:
+    """Deterministic 'random' percentage so the same pair always gets the same result."""
+    combined = f"{min(id1, id2)}-{max(id1, id2)}"
+    digest = hashlib.sha256(combined.encode()).hexdigest()
+    return int(digest, 16) % 101
+
+
+SHIP_TIERS = [
+    (0, 15, "💀 Certified disaster. Please seek professional help."),
+    (16, 30, "😬 Rocky at best. It might work on paper, not in real life."),
+    (31, 50, "🤷 Coinflip energy. Could go either way."),
+    (51, 70, "💛 There's something here. Cautiously optimistic."),
+    (71, 85, "💖 Genuinely cute. This could actually happen."),
+    (86, 95, "🔥 Soulmates. The universe is trying to tell you something."),
+    (96, 100, "💍 Married in another timeline. Might already be happening."),
+]
+
+ROAST_LINES = [
+    "you have the personality of a loading screen.",
+    "you're the reason the mute button exists.",
+    "even your shadow looks tired of you.",
+    "you bring everyone so much joy... when you leave the call.",
+    "you're proof that evolution can go in reverse.",
+    "I've seen more effort in a school group project you didn't do.",
+    "your aim is so bad, the enemy team feels safe.",
+    "you're like a Wi-Fi signal — weak and constantly dropping.",
+]
+
+COMPLIMENT_LINES = [
+    "genuinely one of the good ones, don't ever change.",
+    "your energy could power a small city.",
+    "you make this server better just by being in it.",
+    "certified vibe curator, no notes.",
+    "if kindness had a face, it'd probably look like yours.",
+    "you're the plot twist nobody saw coming — in a good way.",
+]
+
+FIGHT_MOVES = [
+    "throws a devastating haymaker",
+    "lands a critical hit out of nowhere",
+    "trips over their own feet but somehow recovers",
+    "unleashes a flurry of attacks",
+    "calls in a surprise ally for backup",
+    "uses forbidden technique: rage quit threats",
+]
+
+
+async def fetch_reaction_gif(reaction: str) -> str:
+    """Uses the free, no-key otakugifs API for anime hug/kiss reaction gifs."""
+    url = f"https://api.otakugifs.xyz/gif?reaction={reaction}"
+    async with http_session.get(url) as resp:
+        data = await resp.json()
+        return data["url"]
+
+
+# ==================== EVENTS ====================
+
 @bot.event
 async def on_ready():
+    global http_session
+    if http_session is None:
+        http_session = aiohttp.ClientSession()
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"🎬 Using FFmpeg at: {FFMPEG_EXECUTABLE}")
     print(f"🍪 YouTube cookies loaded: {bool(YOUTUBE_COOKIES)}")
@@ -277,8 +428,6 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
-# ---------------- Reaction role events ----------------
-
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.member is None or payload.member.bot:
@@ -318,26 +467,17 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         pass
 
 
-# ---------------- Basic commands ----------------
+# ==================== BASIC COMMANDS ====================
 
 @bot.hybrid_command(description="Check if the bot is alive")
 async def hello(ctx):
-    embed = discord.Embed(
-        description=f"Hey {ctx.author.mention}! I'm alive 🎉",
-        color=COLOR_PRIMARY
-    )
-    await ctx.send(embed=embed)
+    await ctx.send(embed=simple_embed(f"Hey {ctx.author.mention}! I'm alive 🎉", COLOR_PRIMARY))
 
 
 @bot.hybrid_command(description="Check the bot's latency")
 async def ping(ctx):
     latency_ms = round(bot.latency * 1000)
-    embed = discord.Embed(
-        title="🏓 Pong!",
-        description=f"Latency: **{latency_ms}ms**",
-        color=COLOR_PRIMARY
-    )
-    await ctx.send(embed=embed)
+    await ctx.send(embed=discord.Embed(title="🏓 Pong!", description=f"Latency: **{latency_ms}ms**", color=COLOR_PRIMARY))
 
 
 @bot.hybrid_command(description="Roll a dice")
@@ -351,18 +491,25 @@ async def roll(ctx, sides: int = 6):
     await ctx.send(embed=embed)
 
 
-@bot.hybrid_command(description="Show a user's avatar")
+@bot.hybrid_command(description="Show a user's avatar, with a bit of attitude")
 async def avatar(ctx, member: discord.Member = None):
     member = member or ctx.author
+    is_compliment = random.random() < 0.55
+    line = random.choice(COMPLIMENT_LINES if is_compliment else ROAST_LINES)
+
     embed = discord.Embed(
         title=f"{member.display_name}'s Avatar",
+        description=f"{member.mention} — {line}",
         color=member.color if member.color.value != 0 else COLOR_PRIMARY
     )
     embed.set_image(url=member.display_avatar.url)
-    await ctx.send(embed=embed)
+
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="⬇️ Download", url=member.display_avatar.url, style=discord.ButtonStyle.link))
+    await ctx.send(embed=embed, view=view)
 
 
-# ---------------- Leveling commands ----------------
+# ==================== LEVELING COMMANDS ====================
 
 @bot.hybrid_command(description="Check your (or someone else's) level and XP")
 async def rank(ctx, member: discord.Member = None):
@@ -406,18 +553,150 @@ async def leaderboard(ctx):
         prefix = medals[i - 1] if i <= 3 else f"`#{i}`"
         lines.append(f"{prefix}  **{name}** — Level {level} ({xp} XP)")
 
-    embed = discord.Embed(
-        title=f"🏆 {ctx.guild.name} Leaderboard",
-        description="\n".join(lines),
-        color=COLOR_PRIMARY
-    )
+    embed = discord.Embed(title=f"🏆 {ctx.guild.name} Leaderboard", description="\n".join(lines), color=COLOR_PRIMARY)
     if top_member:
         embed.set_thumbnail(url=top_member.display_avatar.url)
     embed.set_footer(text=f"Top {len(rows)} member{'s' if len(rows) != 1 else ''} by level")
     await ctx.send(embed=embed)
 
 
-# ---------------- Music commands ----------------
+# ==================== FUN / LOVE COMMANDS ====================
+
+@bot.hybrid_command(description="Ship two members and see their compatibility")
+async def ship(ctx, member1: discord.Member, member2: discord.Member = None):
+    member2 = member2 or ctx.author
+    percent = ship_percentage(member1.id, member2.id)
+    flavor = next(text for lo, hi, text in SHIP_TIERS if lo <= percent <= hi)
+
+    try:
+        avatar1_bytes = await fetch_image_bytes(str(member1.display_avatar.url))
+        avatar2_bytes = await fetch_image_bytes(str(member2.display_avatar.url))
+        loop = asyncio.get_event_loop()
+        image_buffer = await loop.run_in_executor(None, generate_ship_image, avatar1_bytes, avatar2_bytes)
+        file = discord.File(image_buffer, filename="ship.png")
+
+        embed = discord.Embed(
+            title=f"💘 {member1.display_name} × {member2.display_name}",
+            description=f"**{percent}%** compatible\n{flavor}",
+            color=COLOR_FUN
+        )
+        embed.set_image(url="attachment://ship.png")
+        await ctx.send(embed=embed, file=file)
+    except Exception as e:
+        print(f"Ship image error: {e}")
+        embed = discord.Embed(
+            title=f"💘 {member1.display_name} × {member2.display_name}",
+            description=f"**{percent}%** compatible\n{flavor}",
+            color=COLOR_FUN
+        )
+        await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Pet someone's avatar")
+async def pet(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    try:
+        avatar_bytes = await fetch_image_bytes(str(member.display_avatar.url))
+        loop = asyncio.get_event_loop()
+        gif_buffer = await loop.run_in_executor(None, generate_petpet_gif, avatar_bytes)
+        file = discord.File(gif_buffer, filename="pet.gif")
+
+        embed = discord.Embed(
+            description=f"{ctx.author.mention} is petting {member.mention} 🖐️",
+            color=COLOR_FUN
+        )
+        embed.set_image(url="attachment://pet.gif")
+        await ctx.send(embed=embed, file=file)
+    except Exception as e:
+        print(f"Pet gif error: {e}")
+        await ctx.send(embed=simple_embed(f"{ctx.author.mention} is petting {member.mention} 🖐️", COLOR_FUN))
+
+
+@bot.hybrid_command(description="Hug someone")
+async def hug(ctx, member: discord.Member):
+    embed = discord.Embed(
+        description=f"{ctx.author.mention} hugs {member.mention} 🤗",
+        color=COLOR_FUN
+    )
+    try:
+        gif_url = await fetch_reaction_gif("hug")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Hug gif error: {e}")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Kiss someone")
+async def kiss(ctx, member: discord.Member):
+    embed = discord.Embed(
+        description=f"{ctx.author.mention} kisses {member.mention} 💋",
+        color=COLOR_FUN
+    )
+    try:
+        gif_url = await fetch_reaction_gif("kiss")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Kiss gif error: {e}")
+    await ctx.send(embed=embed)
+
+
+# ==================== WILDCARD COMMANDS ====================
+
+@bot.hybrid_command(description="Roast someone (all in good fun)")
+async def roast(ctx, member: discord.Member):
+    line = random.choice(ROAST_LINES)
+    embed = discord.Embed(
+        description=f"{member.mention}, {line}",
+        color=COLOR_DANGER
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Simulate an epic fight between two members")
+async def fight(ctx, member1: discord.Member, member2: discord.Member):
+    winner = random.choice([member1, member2])
+    loser = member2 if winner == member1 else member1
+    move1 = random.choice(FIGHT_MOVES)
+    move2 = random.choice(FIGHT_MOVES)
+
+    embed = discord.Embed(
+        title="⚔️ FIGHT!",
+        description=(
+            f"{member1.mention} {move1}!\n"
+            f"{member2.mention} {move2}!\n\n"
+            f"🏆 **{winner.display_name}** wins! {loser.display_name} has been defeated."
+        ),
+        color=COLOR_DANGER
+    )
+    embed.set_thumbnail(url=winner.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Rate how much one member simps for another")
+async def simprate(ctx, member1: discord.Member, member2: discord.Member = None):
+    member2 = member2 or ctx.author
+    percent = ship_percentage(member1.id + 1, member2.id + 1)  # offset so it differs from /ship
+
+    if percent < 20:
+        flavor = "Doesn't even know they exist. Zero simp detected."
+    elif percent < 50:
+        flavor = "A little smitten, nothing serious yet."
+    elif percent < 80:
+        flavor = "Certified simp behavior. It's giving obsessed."
+    else:
+        flavor = "Would drop everything, cancel plans, and change their whole personality. Full simp."
+
+    embed = discord.Embed(
+        title=f"💗 Simp Meter: {member1.display_name} → {member2.display_name}",
+        description=f"**{percent}%**\n{flavor}",
+        color=COLOR_FUN
+    )
+    embed.set_thumbnail(url=member1.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+# ==================== MUSIC COMMANDS ====================
 
 @bot.hybrid_command(description="Play a song from a YouTube link, Spotify link, or search term")
 async def play(ctx, *, query: str):
@@ -447,11 +726,7 @@ async def play(ctx, *, query: str):
     if not voice_client.is_playing() and not voice_client.is_paused():
         await play_next(ctx)
     else:
-        embed = discord.Embed(
-            title="➕ Added to Queue",
-            description=f"**{song['title']}**",
-            color=COLOR_MUSIC
-        )
+        embed = discord.Embed(title="➕ Added to Queue", description=f"**{song['title']}**", color=COLOR_MUSIC)
         await ctx.send(embed=embed)
 
 
@@ -501,11 +776,7 @@ async def queue(ctx):
         await ctx.send(embed=simple_embed("The queue is empty.", COLOR_WARNING))
         return
     lines = [f"{i+1}. {s['title']}" for i, s in enumerate(songs)]
-    embed = discord.Embed(
-        title="📜 Song Queue",
-        description="\n".join(lines),
-        color=COLOR_MUSIC
-    )
+    embed = discord.Embed(title="📜 Song Queue", description="\n".join(lines), color=COLOR_MUSIC)
     await ctx.send(embed=embed)
 
 
@@ -520,7 +791,7 @@ async def leave(ctx):
         await ctx.send(embed=simple_embed("⚠️ I'm not in a voice channel.", COLOR_WARNING))
 
 
-# ---------------- Reaction role commands (Owner/Admin roles only) ----------------
+# ==================== REACTION ROLE COMMANDS ====================
 
 @bot.hybrid_command(description="Set up a reaction role: react to a message with an emoji to get a role")
 @is_mod()
@@ -577,15 +848,11 @@ async def listreactionroles(ctx, message_id: str):
         role = ctx.guild.get_role(role_id)
         role_name = role.name if role else f"Unknown Role ({role_id})"
         lines.append(f"{emoji} → {role_name}")
-    embed = discord.Embed(
-        title="🎭 Reaction Roles",
-        description="\n".join(lines),
-        color=COLOR_PRIMARY
-    )
+    embed = discord.Embed(title="🎭 Reaction Roles", description="\n".join(lines), color=COLOR_PRIMARY)
     await ctx.send(embed=embed)
 
 
-# ---------------- Moderation commands (Owner/Admin roles only) ----------------
+# ==================== MODERATION COMMANDS ====================
 
 @bot.hybrid_command(description="Kick a member from the server")
 @is_mod()
@@ -621,12 +888,7 @@ async def unban(ctx, *, user_input: str):
         await ctx.send(embed=simple_embed("⚠️ Couldn't find that user in the ban list.", COLOR_WARNING))
         return
     await ctx.guild.unban(target.user)
-    embed = discord.Embed(
-        title="✅ Member Unbanned",
-        description=str(target.user),
-        color=COLOR_SUCCESS
-    )
-    await ctx.send(embed=embed)
+    await ctx.send(embed=discord.Embed(title="✅ Member Unbanned", description=str(target.user), color=COLOR_SUCCESS))
 
 
 @bot.hybrid_command(description="Timeout (mute) a member for N minutes")
@@ -646,11 +908,7 @@ async def mute(ctx, member: discord.Member, minutes: int, *, reason: str = "No r
 @is_mod()
 async def unmute(ctx, member: discord.Member):
     await member.timeout(None)
-    embed = discord.Embed(
-        title="🔊 Member Unmuted",
-        description=member.mention,
-        color=COLOR_SUCCESS
-    )
+    embed = discord.Embed(title="🔊 Member Unmuted", description=member.mention, color=COLOR_SUCCESS)
     embed.set_thumbnail(url=member.display_avatar.url)
     await ctx.send(embed=embed)
 
@@ -666,13 +924,8 @@ async def clear(ctx, amount: int = 5):
 @bot.hybrid_command(description="Send a warning DM to a member")
 @is_mod()
 async def warn(ctx, member: discord.Member, *, reason: str = "No reason provided"):
-    dm_embed = discord.Embed(
-        title="⚠️ You have been warned",
-        description=f"In **{ctx.guild.name}**",
-        color=COLOR_WARNING
-    )
+    dm_embed = discord.Embed(title="⚠️ You have been warned", description=f"In **{ctx.guild.name}**", color=COLOR_WARNING)
     dm_embed.add_field(name="Reason", value=reason)
-
     try:
         await member.send(embed=dm_embed)
         await ctx.send(embed=simple_embed(f"✅ Warned {member.mention}.", COLOR_SUCCESS))
@@ -686,7 +939,7 @@ async def warn(ctx, member: discord.Member, *, reason: str = "No reason provided
         await ctx.send(embed=embed)
 
 
-# ---------------- Error handling ----------------
+# ==================== ERROR HANDLING ====================
 
 @bot.event
 async def on_command_error(ctx, error):
