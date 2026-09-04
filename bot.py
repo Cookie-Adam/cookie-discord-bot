@@ -13,10 +13,16 @@ import imageio_ffmpeg
 # Load token from .env file
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
+
+# If cookies were provided via environment variable, write them to a local file
+# so yt-dlp can use them. This avoids ever committing the cookies file to Git.
+COOKIES_PATH = "cookies.txt"
+if YOUTUBE_COOKIES:
+    with open(COOKIES_PATH, "w", encoding="utf-8") as f:
+        f.write(YOUTUBE_COOKIES)
 
 # Bundled FFmpeg binary path (installed via the imageio-ffmpeg pip package).
-# This avoids depending on Railway's system-level package installer, which was
-# proving unreliable across deployments.
 FFMPEG_EXECUTABLE = imageio_ffmpeg.get_ffmpeg_exe()
 
 # ---- Set the exact names of roles allowed to use moderation commands ----
@@ -124,6 +130,9 @@ def get_reaction_roles_for_message(message_id: int):
 
 
 # ---------------- Music setup ----------------
+# Uses real YouTube cookies (from YOUTUBE_COOKIES env var) when available, which is
+# the most reliable way to avoid YouTube's "Sign in to confirm you're not a bot" block
+# on cloud/datacenter IPs. Falls back to android/ios client spoofing if no cookies set.
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -137,6 +146,9 @@ YTDL_OPTS = {
         }
     },
 }
+
+if YOUTUBE_COOKIES:
+    YTDL_OPTS["cookiefile"] = COOKIES_PATH
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -194,6 +206,7 @@ async def play_next(ctx):
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"🎬 Using FFmpeg at: {FFMPEG_EXECUTABLE}")
+    print(f"🍪 YouTube cookies loaded: {bool(YOUTUBE_COOKIES)}")
     try:
         synced = await bot.tree.sync()
         print(f"🔄 Synced {len(synced)} slash command(s)")
@@ -559,7 +572,7 @@ async def on_command_error(ctx, error):
         try:
             await ctx.send("⚠️ Something went wrong running that command.")
         except discord.NotFound:
-            pass  # interaction already expired; nothing more we can do
+            pass
 
 
 # Run the bot
