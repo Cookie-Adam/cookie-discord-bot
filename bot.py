@@ -8,10 +8,16 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 import yt_dlp
+import imageio_ffmpeg
 
 # Load token from .env file
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+# Bundled FFmpeg binary path (installed via the imageio-ffmpeg pip package).
+# This avoids depending on Railway's system-level package installer, which was
+# proving unreliable across deployments.
+FFMPEG_EXECUTABLE = imageio_ffmpeg.get_ffmpeg_exe()
 
 # ---- Set the exact names of roles allowed to use moderation commands ----
 MOD_ROLE_NAMES = ["🌟 𝒪𝓌𝓃𝑒𝓇 ✨👑", "🌸 𝒜𝒹𝓂𝒾𝓃 🛠️💼"]
@@ -118,9 +124,6 @@ def get_reaction_roles_for_message(message_id: int):
 
 
 # ---------------- Music setup ----------------
-# player_client forces yt-dlp to pretend to be the YouTube Android/iOS app instead
-# of a browser, which usually avoids the "Sign in to confirm you're not a bot" block
-# that YouTube throws at requests coming from cloud/datacenter IPs (like Railway's).
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -172,7 +175,7 @@ async def play_next(ctx):
         return
     song = queue.pop(0)
     voice_client = ctx.guild.voice_client
-    source = discord.FFmpegPCMAudio(song["url"], **FFMPEG_OPTS)
+    source = discord.FFmpegPCMAudio(song["url"], executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTS)
 
     def after_playing(error):
         if error:
@@ -190,6 +193,7 @@ async def play_next(ctx):
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"🎬 Using FFmpeg at: {FFMPEG_EXECUTABLE}")
     try:
         synced = await bot.tree.sync()
         print(f"🔄 Synced {len(synced)} slash command(s)")
@@ -552,7 +556,10 @@ async def on_command_error(ctx, error):
         await ctx.send("⚠️ Invalid argument provided.")
     else:
         print(f"Unhandled error: {error}")
-        await ctx.send("⚠️ Something went wrong running that command.")
+        try:
+            await ctx.send("⚠️ Something went wrong running that command.")
+        except discord.NotFound:
+            pass  # interaction already expired; nothing more we can do
 
 
 # Run the bot
