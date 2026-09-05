@@ -676,6 +676,34 @@ async def run_memegame(game: MemeGame):
             "use Discord's GIF button, or paste a direct image/gif link.",
             COLOR_MUSIC
         ))
+
+        # DM every player so they don't have to be watching the channel to catch the scenario
+        dm_failed = []
+        dm_embed = discord.Embed(
+            title=f"🎮 Round {round_index}/{total_rounds} — Your turn to submit!",
+            description=(
+                f"**Scenario:** {scenario}\n\n"
+                f"You have **{SUBMIT_WINDOW_SECONDS} seconds**. Reply right here in this DM with an image/gif "
+                f"(upload a file, use Discord's GIF button, or paste a direct image link) — or use `/submit` "
+                f"back in the server."
+            ),
+            color=COLOR_FUN
+        )
+        for p in game.players:
+            try:
+                await p.send(embed=dm_embed)
+            except discord.Forbidden:
+                dm_failed.append(p)
+            except discord.HTTPException:
+                dm_failed.append(p)
+
+        if dm_failed:
+            names = ", ".join(p.mention for p in dm_failed)
+            await channel.send(embed=simple_embed(
+                f"⚠️ Couldn't DM: {names} — they'll need to use `/submit` in the server instead.",
+                COLOR_WARNING
+            ))
+
         countdown_msg = await channel.send(embed=discord.Embed(description=f"📸 Submissions close in **{SUBMIT_WINDOW_SECONDS}s**...", color=COLOR_MUSIC))
         await run_countdown(countdown_msg, SUBMIT_WINDOW_SECONDS, "📸 Submissions close in", COLOR_MUSIC)
 
