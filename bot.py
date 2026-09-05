@@ -72,6 +72,12 @@ cursor.execute("""
         PRIMARY KEY (user1_id, user2_id, guild_id)
     )
 """)
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS welcome_config (
+        guild_id INTEGER PRIMARY KEY,
+        channel_id INTEGER
+    )
+""")
 db.commit()
 
 xp_cooldowns = {}
@@ -190,6 +196,36 @@ def ordinal(n: int) -> str:
     return f"{n}{suffix}"
 
 
+def set_welcome_channel(guild_id: int, channel_id: int):
+    cursor.execute(
+        "INSERT OR REPLACE INTO welcome_config (guild_id, channel_id) VALUES (?, ?)",
+        (guild_id, channel_id)
+    )
+    db.commit()
+
+
+def get_welcome_channel_id(guild_id: int):
+    cursor.execute("SELECT channel_id FROM welcome_config WHERE guild_id = ?", (guild_id,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+CHOOM_WELCOME_LINES = [
+    "another choom just rolled into the neighborhood — keep your chrome polished.",
+    "fresh face, fresh start. Welcome to the crew, choom.",
+    "the squad just got a little more nova.",
+    "step outta the elevator and into the family, choom.",
+    "preem timing — we just got a new choom to run with.",
+    "another legend checks in. Delta on in, choom.",
+    "the Chooms just leveled up — welcome to the crew.",
+    "new choom detected. Chrome up, we've got you covered.",
+    "welcome home, choom — the streets are friendlier in here.",
+    "one more choom for the crew, and the crew's better for it.",
+    "the block just got a new resident — nova to have you, choom.",
+    "another face, another story — welcome to the family, choom.",
+]
+
+
 def add_reaction_role(message_id: int, emoji: str, role_id: int, guild_id: int):
     cursor.execute(
         "INSERT OR REPLACE INTO reaction_roles (message_id, emoji, role_id, guild_id) VALUES (?, ?, ?, ?)",
@@ -224,6 +260,11 @@ YTDL_OPTS = {
 
 if YOUTUBE_COOKIES:
     YTDL_OPTS["cookiefile"] = COOKIES_PATH
+    YTDL_OPTS["extractor_args"] = {
+        "youtube": {
+            "player_client": ["default", "web_embedded"],
+        }
+    }
 else:
     YTDL_OPTS["extractor_args"] = {
         "youtube": {
@@ -1030,9 +1071,14 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member):
-    channel = discord.utils.get(member.guild.text_channels, name="general")
+    channel_id = get_welcome_channel_id(member.guild.id)
+    channel = member.guild.get_channel(channel_id) if channel_id else None
+    if channel is None:
+        channel = discord.utils.get(member.guild.text_channels, name="general")
     if channel is None:
         return
+
+    greeting = random.choice(CHOOM_WELCOME_LINES)
     try:
         avatar_bytes = await fetch_image_bytes(str(member.display_avatar.url))
         loop = asyncio.get_event_loop()
@@ -1040,18 +1086,41 @@ async def on_member_join(member):
             None, generate_welcome_image, avatar_bytes, member.display_name, member.guild.member_count
         )
         file = discord.File(banner_buf, filename="welcome.png")
-        embed = discord.Embed(color=COLOR_FUN)
+        embed = discord.Embed(description=f"{member.mention} — {greeting}", color=COLOR_FUN)
         embed.set_image(url="attachment://welcome.png")
         await channel.send(content=member.mention, embed=embed, file=file)
     except Exception as e:
         print(f"Welcome image error: {e}")
         embed = discord.Embed(
             title="👋 Welcome!",
-            description=f"Welcome to The Chooms, {member.mention}!",
+            description=f"{member.mention} — {greeting}",
             color=COLOR_SUCCESS
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         await channel.send(embed=embed)
+
+
+@bot.hybrid_command(description="Set the channel where new members get welcomed")
+@is_mod()
+async def setwelcomechannel(ctx, channel: discord.TextChannel = None):
+    channel = channel or ctx.channel
+    set_welcome_channel(ctx.guild.id, channel.id)
+    await ctx.send(embed=simple_embed(f"✅ New members will now be welcomed in {channel.mention}.", COLOR_SUCCESS))
+
+
+@bot.hybrid_command(description="Preview the welcome banner using your own avatar")
+@is_mod()
+async def testwelcome(ctx):
+    greeting = random.choice(CHOOM_WELCOME_LINES)
+    avatar_bytes = await fetch_image_bytes(str(ctx.author.display_avatar.url))
+    loop = asyncio.get_event_loop()
+    banner_buf = await loop.run_in_executor(
+        None, generate_welcome_image, avatar_bytes, ctx.author.display_name, ctx.guild.member_count
+    )
+    file = discord.File(banner_buf, filename="welcome.png")
+    embed = discord.Embed(description=f"{ctx.author.mention} — {greeting}", color=COLOR_FUN)
+    embed.set_image(url="attachment://welcome.png")
+    await ctx.send(content=ctx.author.mention, embed=embed, file=file)
 
 
 @bot.event
