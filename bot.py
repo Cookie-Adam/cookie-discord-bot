@@ -9,9 +9,10 @@ import hashlib
 import sqlite3
 import discord
 import aiohttp
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from zoneinfo import ZoneInfo
 import yt_dlp
 import imageio_ffmpeg
 
@@ -74,6 +75,18 @@ cursor.execute("""
 """)
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS welcome_config (
+        guild_id INTEGER PRIMARY KEY,
+        channel_id INTEGER
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS announce_config (
+        guild_id INTEGER PRIMARY KEY,
+        channel_id INTEGER
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS prayer_config (
         guild_id INTEGER PRIMARY KEY,
         channel_id INTEGER
     )
@@ -208,6 +221,39 @@ def get_welcome_channel_id(guild_id: int):
     cursor.execute("SELECT channel_id FROM welcome_config WHERE guild_id = ?", (guild_id,))
     row = cursor.fetchone()
     return row[0] if row else None
+
+
+def set_announce_channel(guild_id: int, channel_id: int):
+    cursor.execute(
+        "INSERT OR REPLACE INTO announce_config (guild_id, channel_id) VALUES (?, ?)",
+        (guild_id, channel_id)
+    )
+    db.commit()
+
+
+def get_announce_channel_id(guild_id: int):
+    cursor.execute("SELECT channel_id FROM announce_config WHERE guild_id = ?", (guild_id,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def set_prayer_channel(guild_id: int, channel_id: int):
+    cursor.execute(
+        "INSERT OR REPLACE INTO prayer_config (guild_id, channel_id) VALUES (?, ?)",
+        (guild_id, channel_id)
+    )
+    db.commit()
+
+
+def get_prayer_channel_id(guild_id: int):
+    cursor.execute("SELECT channel_id FROM prayer_config WHERE guild_id = ?", (guild_id,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def get_all_prayer_channels():
+    cursor.execute("SELECT guild_id, channel_id FROM prayer_config")
+    return cursor.fetchall()
 
 
 CHOOM_WELCOME_LINES = [
@@ -589,6 +635,73 @@ async def fetch_reaction_gif(reaction: str) -> str:
     async with http_session.get(url) as resp:
         data = await resp.json()
         return data["url"]
+
+
+# ==================== PRAYER TIME REMINDERS ====================
+# Uses the free AlAdhan API for Tripoli, Libya. Method 5 (Egyptian General
+# Authority of Survey) is the calculation method most commonly used across
+# Libya/North Africa — adjust PRAYER_METHOD if your local times differ.
+
+LIBYA_TZ = ZoneInfo("Africa/Tripoli")
+PRAYER_CITY = "Tripoli"
+PRAYER_COUNTRY = "Libya"
+PRAYER_METHOD = 5
+PRAYER_NAMES = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
+
+prayer_times_cache = {"date": None, "times": {}}
+prayer_fired_today = set()
+
+
+async def fetch_prayer_times():
+    date_str = datetime.datetime.now(LIBYA_TZ).strftime("%d-%m-%Y")
+    url = (
+        f"https://api.aladhan.com/v1/timingsByCity/{date_str}"
+        f"?city={PRAYER_CITY}&country={PRAYER_COUNTRY}&method={PRAYER_METHOD}"
+    )
+    async with http_session.get(url) as resp:
+        data = await resp.json()
+        return data["data"]["timings"]
+
+
+async def send_prayer_reminders(prayer_name: str, time_str: str):
+    for guild_id, channel_id in get_all_prayer_channels():
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            continue
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            continue
+        embed = discord.Embed(
+            title="🕌 Prayer Time",
+            description=f"It's time for **{prayer_name}** prayer in Tripoli, Libya — {time_str}",
+            color=COLOR_SUCCESS
+        )
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException:
+            pass
+
+
+@tasks.loop(minutes=1)
+async def prayer_reminder_loop():
+    now = datetime.datetime.now(LIBYA_TZ)
+    today_str = now.strftime("%Y-%m-%d")
+
+    if prayer_times_cache["date"] != today_str:
+        try:
+            timings = await fetch_prayer_times()
+            prayer_times_cache["date"] = today_str
+            prayer_times_cache["times"] = {name: timings[name].split(" ")[0] for name in PRAYER_NAMES}
+            prayer_fired_today.clear()
+        except Exception as e:
+            print(f"Prayer time fetch error: {e}")
+            return
+
+    current_hm = now.strftime("%H:%M")
+    for name, time_str in prayer_times_cache["times"].items():
+        if time_str == current_hm and name not in prayer_fired_today:
+            prayer_fired_today.add(name)
+            await send_prayer_reminders(name, time_str)
 
 
 MIN_PLAYERS = 4
@@ -1061,6 +1174,8 @@ async def on_ready():
     print(f"🎬 Using FFmpeg at: {FFMPEG_EXECUTABLE}")
     print(f"🍪 YouTube cookies loaded: {bool(YOUTUBE_COOKIES)}")
     await ensure_fonts()
+    if not prayer_reminder_loop.is_running():
+        prayer_reminder_loop.start()
     try:
         synced = await bot.tree.sync()
         print(f"🔄 Synced {len(synced)} slash command(s)")
@@ -1121,6 +1236,59 @@ async def testwelcome(ctx):
     embed = discord.Embed(description=f"{ctx.author.mention} — {greeting}", color=COLOR_FUN)
     embed.set_image(url="attachment://welcome.png")
     await ctx.send(content=ctx.author.mention, embed=embed, file=file)
+
+
+@bot.hybrid_command(description="Set the channel where announcements get posted")
+@is_mod()
+async def setannouncechannel(ctx, channel: discord.TextChannel = None):
+    channel = channel or ctx.channel
+    set_announce_channel(ctx.guild.id, channel.id)
+    await ctx.send(embed=simple_embed(f"✅ Announcements will now be posted in {channel.mention}.", COLOR_SUCCESS))
+
+
+@bot.hybrid_command(description="Post an announcement to the configured channel")
+@is_mod()
+async def announce(ctx, *, message: str, ping: bool = False):
+    channel_id = get_announce_channel_id(ctx.guild.id)
+    channel = ctx.guild.get_channel(channel_id) if channel_id else ctx.channel
+
+    embed = discord.Embed(title="📢 Announcement", description=message, color=COLOR_PRIMARY)
+    embed.set_footer(text=f"Posted by {ctx.author.display_name}")
+    content = "@everyone" if ping else None
+
+    await channel.send(content=content, embed=embed)
+    if channel.id != ctx.channel.id:
+        await ctx.send(embed=simple_embed(f"✅ Announcement posted in {channel.mention}.", COLOR_SUCCESS))
+
+
+@bot.hybrid_command(description="Set the channel for Islamic prayer time reminders (Tripoli, Libya)")
+@is_mod()
+async def setprayerchannel(ctx, channel: discord.TextChannel = None):
+    channel = channel or ctx.channel
+    set_prayer_channel(ctx.guild.id, channel.id)
+    prayer_times_cache["date"] = None  # force a refresh on the next loop tick
+    await ctx.send(embed=simple_embed(
+        f"✅ Prayer time reminders (Tripoli, Libya) will now be posted in {channel.mention}.",
+        COLOR_SUCCESS
+    ))
+
+
+@bot.hybrid_command(description="Show today's prayer times for Tripoli, Libya")
+async def prayertimes(ctx):
+    try:
+        if prayer_times_cache["date"] != datetime.datetime.now(LIBYA_TZ).strftime("%Y-%m-%d"):
+            timings = await fetch_prayer_times()
+            prayer_times_cache["date"] = datetime.datetime.now(LIBYA_TZ).strftime("%Y-%m-%d")
+            prayer_times_cache["times"] = {name: timings[name].split(" ")[0] for name in PRAYER_NAMES}
+        lines = [f"**{name}** — {time_str}" for name, time_str in prayer_times_cache["times"].items()]
+        embed = discord.Embed(
+            title="🕌 Today's Prayer Times — Tripoli, Libya",
+            description="\n".join(lines),
+            color=COLOR_SUCCESS
+        )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(embed=simple_embed(f"⚠️ Couldn't fetch prayer times right now: {e}", COLOR_WARNING))
 
 
 @bot.event
