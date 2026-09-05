@@ -558,6 +558,24 @@ async def extract_media_from_message(message: discord.Message):
             except Exception:
                 pass
 
+    def find_embed_media(embeds):
+        for embed in embeds:
+            for source in (embed.image, embed.thumbnail):
+                if source and source.url:
+                    return source.url
+            if embed.video and embed.video.url and embed.video.url.lower().endswith((".gif", ".mp4", ".webm")):
+                return embed.video.url
+        return None
+
+    candidate = find_embed_media(message.embeds)
+    if candidate:
+        try:
+            data = await fetch_image_bytes(candidate)
+            filename = candidate.split("/")[-1].split("?")[0] or "submission.gif"
+            return data, filename
+        except Exception:
+            pass
+
     content = message.content or ""
     match = MEDIA_URL_PATTERN.search(content)
     if match:
@@ -569,24 +587,20 @@ async def extract_media_from_message(message: discord.Message):
         except Exception:
             pass
 
-    if "tenor.com" in content.lower():
+    if content.strip():
         await asyncio.sleep(1.5)
         try:
             fresh = await message.channel.fetch_message(message.id)
         except discord.HTTPException:
             fresh = message
-        for embed in fresh.embeds:
-            candidate = None
-            if embed.image and embed.image.url:
-                candidate = embed.image.url
-            elif embed.thumbnail and embed.thumbnail.url:
-                candidate = embed.thumbnail.url
-            if candidate:
-                try:
-                    data = await fetch_image_bytes(candidate)
-                    return data, "submission.gif"
-                except Exception:
-                    continue
+        candidate = find_embed_media(fresh.embeds)
+        if candidate:
+            try:
+                data = await fetch_image_bytes(candidate)
+                filename = candidate.split("/")[-1].split("?")[0] or "submission.gif"
+                return data, filename
+            except Exception:
+                pass
 
     return None
 
