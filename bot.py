@@ -467,9 +467,11 @@ async def fetch_reaction_gif(reaction: str) -> str:
 
 MIN_PLAYERS = 4
 MAX_PLAYERS = 10
-SUBMIT_WINDOW_SECONDS = 30
+SUBMIT_WINDOW_SECONDS = 60
 VOTE_WINDOW_SECONDS = 10
 SCENARIO_WRITE_TIMEOUT = 120
+
+MEDIA_URL_PATTERN = re.compile(r"(https?://\S+\.(?:gif|png|jpe?g|webp))(?:\?\S*)?", re.IGNORECASE)
 
 
 class MemeGame:
@@ -493,6 +495,7 @@ class MemeGame:
 active_games = {}
 lobby_watch = {}
 active_votes = {}
+submitting_players = {}
 
 VOTE_UP = "👍"
 VOTE_DOWN = "👎"
@@ -545,6 +548,81 @@ def make_collage(entries) -> io.BytesIO:
     return buffer
 
 
+async def extract_media_from_message(message: discord.Message):
+    if message.attachments:
+        att = message.attachments[0]
+        if att.content_type and att.content_type.startswith("image"):
+            try:
+                data = await att.read()
+                return data, att.filename
+            except Exception:
+                pass
+
+    content = message.content or ""
+    match = MEDIA_URL_PATTERN.search(content)
+    if match:
+        url = match.group(1)
+        try:
+            data = await fetch_image_bytes(url)
+            filename = url.split("/")[-1].split("?")[0] or "submission.gif"
+            return data, filename
+        except Exception:
+            pass
+
+    if "tenor.com" in content.lower():
+        await asyncio.sleep(1.5)
+        try:
+            fresh = await message.channel.fetch_message(message.id)
+        except discord.HTTPException:
+            fresh = message
+        for embed in fresh.embeds:
+            candidate = None
+            if embed.image and embed.image.url:
+                candidate = embed.image.url
+            elif embed.thumbnail and embed.thumbnail.url:
+                candidate = embed.thumbnail.url
+            if candidate:
+                try:
+                    data = await fetch_image_bytes(candidate)
+                    return data, "submission.gif"
+                except Exception:
+                    continue
+
+    return None
+
+
+async def run_countdown(message: discord.Message, total_seconds: int, label: str, color, event: asyncio.Event = None, step: int = 5):
+    remaining = total_seconds
+    ended_early = False
+
+    while remaining > 0:
+        if event and event.is_set():
+            ended_early = True
+            break
+        try:
+            await message.edit(embed=discord.Embed(description=f"{label} **{remaining}s** remaining...", color=color))
+        except discord.HTTPException:
+            pass
+
+        tick = min(step, remaining)
+        if event:
+            try:
+                await asyncio.wait_for(event.wait(), timeout=tick)
+                ended_early = True
+                break
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(tick)
+        remaining -= tick
+
+    final_text = "✅ Everyone voted!" if ended_early else "⏰ Time's up!"
+    try:
+        await message.edit(embed=discord.Embed(description=final_text, color=color))
+    except discord.HTTPException:
+        pass
+
+
 async def run_memegame(game: MemeGame):
     channel = game.channel
     game.turn_order = random.sample(game.players, len(game.players))
@@ -576,11 +654,19 @@ async def run_memegame(game: MemeGame):
         await channel.send(embed=discord.Embed(title="🎭 Scenario", description=scenario, color=COLOR_FUN))
 
         game.state = "submitting"
+        for p in game.players:
+            submitting_players[p.id] = game
+
         await channel.send(embed=simple_embed(
-            f"📸 Everyone has **{SUBMIT_WINDOW_SECONDS} seconds** to privately submit an image or gif using `/submit`!",
+            "📸 Time to submit! Use `/submit` in the server **or DM me directly** — you can upload a file, "
+            "use Discord's GIF button, or paste a direct image/gif link.",
             COLOR_MUSIC
         ))
-        await asyncio.sleep(SUBMIT_WINDOW_SECONDS)
+        countdown_msg = await channel.send(embed=discord.Embed(description=f"📸 Submissions close in **{SUBMIT_WINDOW_SECONDS}s**...", color=COLOR_MUSIC))
+        await run_countdown(countdown_msg, SUBMIT_WINDOW_SECONDS, "📸 Submissions close in", COLOR_MUSIC)
+
+        for p in game.players:
+            submitting_players.pop(p.id, None)
         game.state = "revealing"
 
         submitted_ids = list(game.submissions.keys())
@@ -600,7 +686,7 @@ async def run_memegame(game: MemeGame):
 
             embed = discord.Embed(
                 title=f"Submission #{idx}/{len(submitted_ids)}",
-                description=f"React {VOTE_UP} or {VOTE_DOWN}! You have {VOTE_WINDOW_SECONDS} seconds.",
+                description=f"React {VOTE_UP} or {VOTE_DOWN}!",
                 color=COLOR_FUN
             )
             embed.set_image(url=f"attachment://{safe_filename}")
@@ -617,13 +703,9 @@ async def run_memegame(game: MemeGame):
             }
             active_votes[reveal_msg.id] = vote_data
 
-            async def timeout_setter(ev=vote_data["event"]):
-                await asyncio.sleep(VOTE_WINDOW_SECONDS)
-                if not ev.is_set():
-                    ev.set()
-
-            asyncio.create_task(timeout_setter())
-            await vote_data["event"].wait()
+            countdown_msg = await channel.send(embed=discord.Embed(description=f"⏳ Voting closes in **{VOTE_WINDOW_SECONDS}s**...", color=COLOR_FUN))
+            await run_countdown(countdown_msg, VOTE_WINDOW_SECONDS, "⏳ Voting closes in", COLOR_FUN, event=vote_data["event"], step=2)
+            vote_data["event"].set()
             active_votes.pop(reveal_msg.id, None)
 
             likes = vote_data["counts"][VOTE_UP]
@@ -754,6 +836,8 @@ async def mgcancel(ctx):
         game.task.cancel()
     if game.lobby_message:
         lobby_watch.pop(game.lobby_message.id, None)
+    for p in game.players:
+        submitting_players.pop(p.id, None)
     active_games.pop(ctx.channel.id, None)
     await ctx.send(embed=simple_embed("🛑 Game cancelled.", COLOR_DANGER))
 
@@ -831,7 +915,31 @@ async def on_member_join(member):
 
 @bot.event
 async def on_message(message):
-    if message.author.bot or message.guild is None:
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+
+    if message.guild is None:
+        game = submitting_players.get(message.author.id)
+        if game is not None and game.state == "submitting" and message.author.id not in game.submissions:
+            media = await extract_media_from_message(message)
+            if media:
+                data, filename = media
+                game.submissions[message.author.id] = (data, filename)
+                try:
+                    await message.channel.send(embed=simple_embed(
+                        "✅ Submission received! Head back to the server for the reveal.", COLOR_SUCCESS
+                    ))
+                except discord.HTTPException:
+                    pass
+            else:
+                try:
+                    await message.channel.send(embed=simple_embed(
+                        "⚠️ I couldn't find an image or gif in that — try uploading a file, using the GIF button, or pasting a direct image link.",
+                        COLOR_WARNING
+                    ))
+                except discord.HTTPException:
+                    pass
         await bot.process_commands(message)
         return
 
