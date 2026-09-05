@@ -11,7 +11,7 @@ import discord
 import aiohttp
 from discord.ext import commands
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import yt_dlp
 import imageio_ffmpeg
 
@@ -374,6 +374,91 @@ def generate_l_stamp(avatar_bytes: bytes) -> io.BytesIO:
     return buffer
 
 
+# ---------------- Welcome banner ----------------
+# Fetches a couple of free Google Fonts once at startup so the welcome image
+# has real bold typography instead of the tiny default bitmap font.
+
+FONT_DIR = "fonts"
+BANGERS_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/bangers/Bangers-Regular.ttf"
+POPPINS_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-SemiBold.ttf"
+BANGERS_PATH = os.path.join(FONT_DIR, "Bangers-Regular.ttf")
+POPPINS_PATH = os.path.join(FONT_DIR, "Poppins-SemiBold.ttf")
+
+WELCOME_BG_TOP = (70, 20, 110)
+WELCOME_BG_BOTTOM = (255, 71, 141)
+
+
+async def ensure_fonts():
+    os.makedirs(FONT_DIR, exist_ok=True)
+    for url, path in [(BANGERS_URL, BANGERS_PATH), (POPPINS_URL, POPPINS_PATH)]:
+        if not os.path.exists(path):
+            try:
+                data = await fetch_image_bytes(url)
+                with open(path, "wb") as f:
+                    f.write(data)
+            except Exception as e:
+                print(f"⚠️ Failed to download font {url}: {e}")
+
+
+def load_font(path, size):
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def generate_welcome_image(avatar_bytes: bytes, display_name: str, member_count: int) -> io.BytesIO:
+    W, H = 1000, 560
+
+    # Diagonal gradient background
+    grad = Image.linear_gradient("L").resize((W, H))
+    grad = grad.rotate(25, expand=True).resize((W, H))
+    bg = ImageOps.colorize(grad, black=WELCOME_BG_TOP, white=WELCOME_BG_BOTTOM).convert("RGBA")
+
+    # Scattered translucent "confetti" circles for texture
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    odraw = ImageDraw.Draw(overlay)
+    for cx, cy, r, alpha in [(110, 90, 55, 28), (900, 420, 95, 22), (860, 70, 40, 35),
+                              (60, 460, 65, 20), (500, 30, 25, 30), (950, 250, 30, 25)]:
+        odraw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255, alpha))
+    bg = Image.alpha_composite(bg, overlay)
+
+    draw = ImageDraw.Draw(bg)
+    bangers_big = load_font(BANGERS_PATH, 76)
+    poppins_small = load_font(POPPINS_PATH, 32)
+    poppins_name = load_font(POPPINS_PATH, 44)
+    poppins_footer = load_font(POPPINS_PATH, 24)
+
+    def centered_text(y, text, font, fill=(255, 255, 255, 255), stroke_width=4, stroke_fill=(0, 0, 0, 160)):
+        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+        w = bbox[2] - bbox[0]
+        draw.text(((W - w) / 2, y), text, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
+
+    centered_text(30, "WELCOME TO", poppins_small, stroke_width=3)
+    centered_text(70, "THE CHOOMS", bangers_big, stroke_width=6)
+
+    # Circular avatar with a ring border
+    avatar_size = 200
+    avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((avatar_size, avatar_size))
+    mask = Image.new("L", (avatar_size, avatar_size), 0)
+    ImageDraw.Draw(mask).ellipse([0, 0, avatar_size, avatar_size], fill=255)
+
+    ax, ay = (W - avatar_size) // 2, 190
+    pad = 10
+    draw.ellipse([ax - pad, ay - pad, ax + avatar_size + pad, ay + avatar_size + pad], fill=(255, 255, 255, 255))
+    draw.ellipse([ax - pad + 5, ay - pad + 5, ax + avatar_size + pad - 5, ay + avatar_size + pad - 5],
+                 fill=(255, 71, 141, 255))
+    bg.paste(avatar, (ax, ay), mask)
+
+    centered_text(ay + avatar_size + 18, display_name, poppins_name, stroke_width=4)
+    centered_text(ay + avatar_size + 78, f"Member #{member_count}", poppins_footer, stroke_width=2)
+
+    buffer = io.BytesIO()
+    bg.convert("RGB").save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
 def ship_percentage(id1: int, id2: int) -> int:
     combined = f"{min(id1, id2)}-{max(id1, id2)}"
     digest = hashlib.sha256(combined.encode()).hexdigest()
@@ -496,6 +581,7 @@ active_games = {}
 lobby_watch = {}
 active_votes = {}
 submitting_players = {}
+pending_role_menus = {}  # channel_id -> {"title":..., "description":..., "entries": [(emoji, role_id, label)]}
 
 VOTE_UP = "👍"
 VOTE_DOWN = "👎"
@@ -933,6 +1019,7 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"🎬 Using FFmpeg at: {FFMPEG_EXECUTABLE}")
     print(f"🍪 YouTube cookies loaded: {bool(YOUTUBE_COOKIES)}")
+    await ensure_fonts()
     try:
         synced = await bot.tree.sync()
         print(f"🔄 Synced {len(synced)} slash command(s)")
@@ -944,14 +1031,26 @@ async def on_ready():
 @bot.event
 async def on_member_join(member):
     channel = discord.utils.get(member.guild.text_channels, name="general")
-    if channel:
+    if channel is None:
+        return
+    try:
+        avatar_bytes = await fetch_image_bytes(str(member.display_avatar.url))
+        loop = asyncio.get_event_loop()
+        banner_buf = await loop.run_in_executor(
+            None, generate_welcome_image, avatar_bytes, member.display_name, member.guild.member_count
+        )
+        file = discord.File(banner_buf, filename="welcome.png")
+        embed = discord.Embed(color=COLOR_FUN)
+        embed.set_image(url="attachment://welcome.png")
+        await channel.send(content=member.mention, embed=embed, file=file)
+    except Exception as e:
+        print(f"Welcome image error: {e}")
         embed = discord.Embed(
             title="👋 Welcome!",
-            description=f"Welcome to the server, {member.mention}! We're glad you're here.",
+            description=f"Welcome to The Chooms, {member.mention}!",
             color=COLOR_SUCCESS
         )
         embed.set_thumbnail(url=member.display_avatar.url)
-        embed.set_footer(text=f"Member #{member.guild.member_count}")
         await channel.send(embed=embed)
 
 
@@ -1466,6 +1565,125 @@ async def leave(ctx):
         await ctx.send(embed=simple_embed("👋 Left the voice channel.", COLOR_MUSIC))
     else:
         await ctx.send(embed=simple_embed("⚠️ I'm not in a voice channel.", COLOR_WARNING))
+
+
+def build_role_menu_embed(pending: dict, guild: discord.Guild) -> discord.Embed:
+    lines = []
+    for emoji, role_id, label in pending["entries"]:
+        role = guild.get_role(role_id)
+        role_name = role.name if role else "Unknown role"
+        line = f"{emoji}  —  **{role_name}**"
+        if label:
+            line += f"\n     ↳ {label}"
+        lines.append(line)
+    body = pending["description"]
+    body += "\n\n" + "\n".join(lines) if lines else "\n\n*No options added yet — use `!rolemenu add`.*"
+    embed = discord.Embed(title=pending["title"], description=body, color=COLOR_PRIMARY)
+    embed.set_footer(text="React below to get the matching role!")
+    return embed
+
+
+@bot.hybrid_group(name="rolemenu", description="Build a reaction-role menu, step by step")
+@is_mod()
+async def rolemenu(ctx):
+    if ctx.invoked_subcommand is None:
+        await ctx.send(embed=simple_embed(
+            "Build a role menu in steps:\n"
+            "`!rolemenu new [title]` → start\n"
+            "`!rolemenu desc <text>` → set the description (optional)\n"
+            "`!rolemenu add <emoji> @role [label]` → add an option\n"
+            "`!rolemenu removeoption <emoji>` → remove one\n"
+            "`!rolemenu preview` → see it before posting\n"
+            "`!rolemenu post` → make it live\n"
+            "`!rolemenu cancel` → discard",
+            COLOR_PRIMARY, title="🎭 Role Menu Builder"
+        ))
+
+
+@rolemenu.command(name="new", description="Start building a new role menu in this channel")
+async def rolemenu_new(ctx, *, title: str = "Choose your roles!"):
+    pending_role_menus[ctx.channel.id] = {
+        "title": title,
+        "description": "React to a role below to get it — react again to remove it.",
+        "entries": []
+    }
+    await ctx.send(embed=simple_embed(
+        f"🆕 Started a new role menu: **{title}**. Now add options with `!rolemenu add <emoji> @role [label]`.",
+        COLOR_SUCCESS
+    ))
+
+
+@rolemenu.command(name="desc", description="Set the role menu's description text")
+async def rolemenu_desc(ctx, *, description: str):
+    pending = pending_role_menus.get(ctx.channel.id)
+    if not pending:
+        await ctx.send(embed=simple_embed("⚠️ No pending role menu — start one with `!rolemenu new`.", COLOR_WARNING))
+        return
+    pending["description"] = description
+    await ctx.send(embed=simple_embed("✅ Description updated.", COLOR_SUCCESS))
+
+
+@rolemenu.command(name="add", description="Add an emoji → role option to the pending menu")
+async def rolemenu_add(ctx, emoji: str, role: discord.Role, *, label: str = None):
+    pending = pending_role_menus.get(ctx.channel.id)
+    if not pending:
+        await ctx.send(embed=simple_embed("⚠️ No pending role menu — start one with `!rolemenu new`.", COLOR_WARNING))
+        return
+    pending["entries"] = [e for e in pending["entries"] if e[0] != emoji]
+    pending["entries"].append((emoji, role.id, label))
+    extra = f" — {label}" if label else ""
+    await ctx.send(embed=simple_embed(f"➕ Added {emoji} → **{role.name}**{extra}", COLOR_SUCCESS))
+
+
+@rolemenu.command(name="removeoption", description="Remove an emoji option from the pending menu")
+async def rolemenu_removeoption(ctx, emoji: str):
+    pending = pending_role_menus.get(ctx.channel.id)
+    if not pending:
+        await ctx.send(embed=simple_embed("⚠️ No pending role menu.", COLOR_WARNING))
+        return
+    before = len(pending["entries"])
+    pending["entries"] = [e for e in pending["entries"] if e[0] != emoji]
+    if len(pending["entries"]) == before:
+        await ctx.send(embed=simple_embed(f"⚠️ {emoji} wasn't in the menu.", COLOR_WARNING))
+    else:
+        await ctx.send(embed=simple_embed(f"➖ Removed {emoji}.", COLOR_SUCCESS))
+
+
+@rolemenu.command(name="preview", description="Preview the pending role menu before posting it")
+async def rolemenu_preview(ctx):
+    pending = pending_role_menus.get(ctx.channel.id)
+    if not pending:
+        await ctx.send(embed=simple_embed("⚠️ No pending role menu.", COLOR_WARNING))
+        return
+    await ctx.send(embed=build_role_menu_embed(pending, ctx.guild))
+
+
+@rolemenu.command(name="post", description="Post the finished role menu and make it live")
+async def rolemenu_post(ctx):
+    pending = pending_role_menus.get(ctx.channel.id)
+    if not pending or not pending["entries"]:
+        await ctx.send(embed=simple_embed("⚠️ Nothing to post — add at least one option with `!rolemenu add`.", COLOR_WARNING))
+        return
+
+    embed = build_role_menu_embed(pending, ctx.guild)
+    msg = await ctx.send(embed=embed)
+    for emoji, role_id, label in pending["entries"]:
+        try:
+            await msg.add_reaction(emoji)
+        except discord.HTTPException:
+            continue
+        add_reaction_role(msg.id, emoji, role_id, ctx.guild.id)
+
+    pending_role_menus.pop(ctx.channel.id, None)
+    await ctx.send(embed=simple_embed("✅ Role menu is live!", COLOR_SUCCESS))
+
+
+@rolemenu.command(name="cancel", description="Discard the pending role menu")
+async def rolemenu_cancel(ctx):
+    if pending_role_menus.pop(ctx.channel.id, None):
+        await ctx.send(embed=simple_embed("🗑️ Pending role menu discarded.", COLOR_WARNING))
+    else:
+        await ctx.send(embed=simple_embed("⚠️ No pending role menu to cancel.", COLOR_WARNING))
 
 
 @bot.hybrid_command(description="Set up a reaction role: react to a message with an emoji to get a role")
