@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from zoneinfo import ZoneInfo
 import yt_dlp
 import imageio_ffmpeg
-from petpetgif import petpet as petpetgif
+from petpetgif_fix import petpet as petpetgif
 
 # Load token from .env file
 load_dotenv()
