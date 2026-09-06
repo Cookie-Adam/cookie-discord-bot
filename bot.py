@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from zoneinfo import ZoneInfo
 import yt_dlp
 import imageio_ffmpeg
+from petpetgif import petpet as petpetgif
 
 # Load token from .env file
 load_dotenv()
@@ -377,39 +378,6 @@ async def fetch_image_bytes(url: str) -> bytes:
     async with http_session.get(url) as resp:
         resp.raise_for_status()
         return await resp.read()
-
-
-def generate_petpet_gif(avatar_bytes: bytes) -> io.BytesIO:
-    size = 120
-    avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((size, size))
-    squish_factors = [1.0, 0.85, 0.7, 0.85, 1.0]
-    frames = []
-
-    for factor in squish_factors:
-        frame = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        new_height = int(size * factor)
-        squished_avatar = avatar.resize((size, new_height))
-        y_offset = size - new_height
-        frame.paste(squished_avatar, (0, y_offset), squished_avatar)
-
-        draw = ImageDraw.Draw(frame)
-        hand_y = int(y_offset * 0.6)
-        hand_height = 26
-        draw.ellipse(
-            [size * 0.15, hand_y, size * 0.85, hand_y + hand_height],
-            fill=(255, 224, 189, 255), outline=(120, 90, 60, 255), width=3
-        )
-        for fx in (0.25, 0.45, 0.65):
-            draw.ellipse(
-                [size * fx, hand_y - 8, size * fx + 14, hand_y + 12],
-                fill=(255, 224, 189, 255), outline=(120, 90, 60, 255), width=2
-            )
-        frames.append(frame.convert("RGB"))
-
-    buffer = io.BytesIO()
-    frames[0].save(buffer, format="GIF", save_all=True, append_images=frames[1:], duration=90, loop=0)
-    buffer.seek(0)
-    return buffer
 
 
 def draw_heart(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int, color):
@@ -1555,7 +1523,15 @@ async def pet(ctx, member: discord.Member = None):
     try:
         avatar_bytes = await fetch_image_bytes(str(member.display_avatar.url))
         loop = asyncio.get_event_loop()
-        gif_buffer = await loop.run_in_executor(None, generate_petpet_gif, avatar_bytes)
+
+        def make_gif():
+            source = io.BytesIO(avatar_bytes)
+            dest = io.BytesIO()
+            petpetgif.make(source, dest)
+            dest.seek(0)
+            return dest
+
+        gif_buffer = await loop.run_in_executor(None, make_gif)
         file = discord.File(gif_buffer, filename="pet.gif")
 
         embed = discord.Embed(description=f"{ctx.author.mention} is petting {member.mention} 🖐️", color=COLOR_FUN)

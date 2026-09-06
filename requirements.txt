@@ -6,3 +6,4 @@ davey>=0.1.5
 imageio-ffmpeg>=0.5.1
 Pillow>=10.0.0
 aiohttp>=3.9.0
+pet-pet-gif-fix>=1.0.3
