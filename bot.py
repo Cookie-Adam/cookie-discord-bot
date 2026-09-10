@@ -9,6 +9,7 @@ import hashlib
 import sqlite3
 import discord
 import aiohttp
+from typing import Literal
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -90,6 +91,12 @@ cursor.execute("""
     CREATE TABLE IF NOT EXISTS prayer_config (
         guild_id INTEGER PRIMARY KEY,
         channel_id INTEGER
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS punish_config (
+        guild_id INTEGER PRIMARY KEY,
+        exile_channel_id INTEGER
     )
 """)
 db.commit()
@@ -255,6 +262,20 @@ def get_prayer_channel_id(guild_id: int):
 def get_all_prayer_channels():
     cursor.execute("SELECT guild_id, channel_id FROM prayer_config")
     return cursor.fetchall()
+
+
+def set_exile_channel(guild_id: int, channel_id: int):
+    cursor.execute(
+        "INSERT OR REPLACE INTO punish_config (guild_id, exile_channel_id) VALUES (?, ?)",
+        (guild_id, channel_id)
+    )
+    db.commit()
+
+
+def get_exile_channel_id(guild_id: int):
+    cursor.execute("SELECT exile_channel_id FROM punish_config WHERE guild_id = ?", (guild_id,))
+    row = cursor.fetchone()
+    return row[0] if row else None
 
 
 CHOOM_WELCOME_LINES = [
@@ -603,6 +624,106 @@ async def fetch_reaction_gif(reaction: str) -> str:
     async with http_session.get(url) as resp:
         data = await resp.json()
         return data["url"]
+
+
+# ==================== PUNISHMENT SYSTEM ====================
+
+NICKNAMES_OF_SHAME = [
+    "Professional Disappointment",
+    "Certified Gonk",
+    "Local Menace",
+    "Human Buffering Icon",
+    "Chief Simp Officer",
+    "Walking Red Flag",
+    "Reply Guy",
+    "Server's Biggest L",
+    "NPC Energy",
+    "Chronic AFK",
+    "Ratio'd Royalty",
+    "The Group Chat's Problem",
+]
+
+
+async def do_channel_roulette(member: discord.Member, channel: discord.abc.Messageable):
+    voice_channels = member.guild.voice_channels
+    if len(voice_channels) < 2:
+        await channel.send(embed=simple_embed("⚠️ Need at least 2 voice channels for Channel Roulette.", COLOR_WARNING))
+        return
+    if member.voice is None:
+        await channel.send(embed=simple_embed(f"⚠️ {member.mention} needs to be in a voice channel first.", COLOR_WARNING))
+        return
+
+    original_channel = member.voice.channel
+    await channel.send(embed=discord.Embed(
+        description=f"🎰 {member.mention} has been sentenced to **Channel Roulette**. Hold on tight.",
+        color=COLOR_DANGER
+    ))
+    try:
+        for _ in range(8):
+            target = random.choice(voice_channels)
+            await member.move_to(target)
+            await asyncio.sleep(1.5)
+        await member.move_to(original_channel)
+    except discord.HTTPException:
+        pass
+
+
+async def do_solitary_exile(member: discord.Member, channel: discord.abc.Messageable, guild_id: int):
+    if member.voice is None:
+        await channel.send(embed=simple_embed(f"⚠️ {member.mention} needs to be in a voice channel first.", COLOR_WARNING))
+        return
+    exile_channel_id = get_exile_channel_id(guild_id)
+    exile_channel = member.guild.get_channel(exile_channel_id) if exile_channel_id else None
+    if exile_channel is None:
+        await channel.send(embed=simple_embed("⚠️ No exile channel set — use `/setexilechannel` first.", COLOR_WARNING))
+        return
+    try:
+        await member.move_to(exile_channel)
+        await channel.send(embed=discord.Embed(
+            description=f"🔒 {member.mention} has been banished to **Solitary Exile**. Enjoy the silence.",
+            color=COLOR_DANGER
+        ))
+    except discord.HTTPException:
+        await channel.send(embed=simple_embed("⚠️ Couldn't move that member — check the bot's permissions.", COLOR_WARNING))
+
+
+async def do_nickname_shame(member: discord.Member, channel: discord.abc.Messageable):
+    original_nick = member.nick
+    new_nick = random.choice(NICKNAMES_OF_SHAME)
+    try:
+        await member.edit(nick=new_nick)
+    except discord.Forbidden:
+        await channel.send(embed=simple_embed(
+            "⚠️ I don't have permission to rename that member (role hierarchy issue).", COLOR_WARNING
+        ))
+        return
+
+    await channel.send(embed=discord.Embed(
+        description=f"🏷️ {member.mention} has been renamed **{new_nick}** for 5 minutes.",
+        color=COLOR_DANGER
+    ))
+
+    async def revert():
+        await asyncio.sleep(300)
+        try:
+            await member.edit(nick=original_nick)
+        except discord.HTTPException:
+            pass
+
+    asyncio.create_task(revert())
+
+
+async def do_dm_roast_barrage(member: discord.Member, channel: discord.abc.Messageable):
+    lines = random.sample(ROAST_LINES, k=min(4, len(ROAST_LINES)))
+    try:
+        for line in lines:
+            await member.send(embed=simple_embed(line, COLOR_DANGER))
+            await asyncio.sleep(1)
+        await channel.send(embed=simple_embed(f"📨 {member.mention} has received a DM roast barrage.", COLOR_DANGER))
+    except discord.Forbidden:
+        await channel.send(embed=simple_embed(
+            f"⚠️ Couldn't DM {member.mention} — they might have DMs disabled.", COLOR_WARNING
+        ))
 
 
 # ==================== PRAYER TIME REMINDERS ====================
@@ -1591,6 +1712,30 @@ async def kissstats(ctx, member1: discord.Member, member2: discord.Member = None
     await ctx.send(embed=embed)
 
 
+@bot.hybrid_command(description="Set the voice channel used for the Solitary Exile punishment")
+@is_mod()
+async def setexilechannel(ctx, channel: discord.VoiceChannel):
+    set_exile_channel(ctx.guild.id, channel.id)
+    await ctx.send(embed=simple_embed(f"✅ Solitary Exile will now send members to {channel.mention}.", COLOR_SUCCESS))
+
+
+@bot.hybrid_command(description="Punish a member with a chosen sentence")
+@is_mod()
+async def punish(
+    ctx,
+    member: discord.Member,
+    punishment: Literal["channel_roulette", "solitary_exile", "nickname_shame", "dm_roast"]
+):
+    if punishment == "channel_roulette":
+        await do_channel_roulette(member, ctx.channel)
+    elif punishment == "solitary_exile":
+        await do_solitary_exile(member, ctx.channel, ctx.guild.id)
+    elif punishment == "nickname_shame":
+        await do_nickname_shame(member, ctx.channel)
+    elif punishment == "dm_roast":
+        await do_dm_roast_barrage(member, ctx.channel)
+
+
 @bot.hybrid_command(description="Roast someone (all in good fun)")
 async def roast(ctx, member: discord.Member):
     line = random.choice(ROAST_LINES)
@@ -2020,8 +2165,12 @@ async def unmute(ctx, member: discord.Member):
 @bot.hybrid_command(description="Delete the last N messages in this channel")
 @is_mod()
 async def clear(ctx, amount: int = 5):
-    deleted = await ctx.channel.purge(limit=amount + 1)
-    msg = await ctx.send(embed=simple_embed(f"🧹 Deleted {len(deleted) - 1} message(s).", COLOR_SUCCESS))
+    # Prefix invocations (!clear) post a real message that also needs deleting;
+    # slash invocations (/clear) don't, so only prefix mode needs the +1.
+    limit = amount + 1 if ctx.interaction is None else amount
+    deleted = await ctx.channel.purge(limit=limit)
+    actual_count = len(deleted) - 1 if ctx.interaction is None else len(deleted)
+    msg = await ctx.send(embed=simple_embed(f"🧹 Deleted {actual_count} message(s).", COLOR_SUCCESS))
     await msg.delete(delay=3)
 
 
