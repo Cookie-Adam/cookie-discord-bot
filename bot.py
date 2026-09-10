@@ -1793,6 +1793,72 @@ async def kiss(ctx, member: discord.Member):
     await ctx.send(embed=embed)
 
 
+@bot.hybrid_command(description="Tickle someone")
+async def tickle(ctx, member: discord.Member):
+    embed = discord.Embed(description=f"{ctx.author.mention} tickles {member.mention} 🤣", color=COLOR_FUN)
+    try:
+        gif_url = await fetch_reaction_gif("tickle")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Tickle gif error: {e}")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Pat someone")
+async def pat(ctx, member: discord.Member):
+    embed = discord.Embed(description=f"{ctx.author.mention} pats {member.mention} 🖐️", color=COLOR_FUN)
+    try:
+        gif_url = await fetch_reaction_gif("pat")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Pat gif error: {e}")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Cuddle someone")
+async def cuddle(ctx, member: discord.Member):
+    embed = discord.Embed(description=f"{ctx.author.mention} cuddles up with {member.mention} 🥰", color=COLOR_FUN)
+    try:
+        gif_url = await fetch_reaction_gif("cuddle")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Cuddle gif error: {e}")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Poke someone")
+async def poke(ctx, member: discord.Member):
+    embed = discord.Embed(description=f"{ctx.author.mention} pokes {member.mention} 👉", color=COLOR_FUN)
+    try:
+        gif_url = await fetch_reaction_gif("poke")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Poke gif error: {e}")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Bonk someone")
+async def bonk(ctx, member: discord.Member):
+    embed = discord.Embed(description=f"{ctx.author.mention} bonks {member.mention}! 🔨", color=COLOR_FUN)
+    try:
+        gif_url = await fetch_reaction_gif("bonk")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Bonk gif error: {e}")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="High five someone")
+async def highfive(ctx, member: discord.Member):
+    embed = discord.Embed(description=f"{ctx.author.mention} high fives {member.mention}! ✋", color=COLOR_FUN)
+    try:
+        gif_url = await fetch_reaction_gif("highfive")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Highfive gif error: {e}")
+    await ctx.send(embed=embed)
+
+
 @bot.hybrid_command(description="Check how many times someone has been hugged")
 async def hugstats(ctx, member: discord.Member = None):
     member = member or ctx.author
