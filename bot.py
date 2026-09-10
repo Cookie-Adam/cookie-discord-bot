@@ -2,6 +2,8 @@ import os
 import re
 import io
 import math
+import ast
+import operator
 import random
 import asyncio
 import datetime
@@ -97,6 +99,14 @@ cursor.execute("""
     CREATE TABLE IF NOT EXISTS punish_config (
         guild_id INTEGER PRIMARY KEY,
         exile_channel_id INTEGER
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS counting_config (
+        guild_id INTEGER PRIMARY KEY,
+        channel_id INTEGER,
+        current_count INTEGER DEFAULT 1,
+        last_user_id INTEGER
     )
 """)
 db.commit()
@@ -276,6 +286,65 @@ def get_exile_channel_id(guild_id: int):
     cursor.execute("SELECT exile_channel_id FROM punish_config WHERE guild_id = ?", (guild_id,))
     row = cursor.fetchone()
     return row[0] if row else None
+
+
+def set_counting_channel(guild_id: int, channel_id: int):
+    cursor.execute(
+        "INSERT OR REPLACE INTO counting_config (guild_id, channel_id, current_count, last_user_id) VALUES (?, ?, 1, NULL)",
+        (guild_id, channel_id)
+    )
+    db.commit()
+
+
+def get_counting_config(guild_id: int):
+    cursor.execute(
+        "SELECT channel_id, current_count, last_user_id FROM counting_config WHERE guild_id = ?",
+        (guild_id,)
+    )
+    return cursor.fetchone()
+
+
+def update_counting_state(guild_id: int, count: int, last_user_id):
+    cursor.execute(
+        "UPDATE counting_config SET current_count = ?, last_user_id = ? WHERE guild_id = ?",
+        (count, last_user_id, guild_id)
+    )
+    db.commit()
+
+
+# Safe arithmetic evaluator for the counting game — deliberately does NOT use
+# Python's eval(), since that would let anyone run arbitrary code through a
+# chat message. This only ever allows numbers and +, -, *, /, ** operators.
+_SAFE_MATH_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def safe_eval_math(expr: str):
+    try:
+        node = ast.parse(expr, mode="eval").body
+    except SyntaxError:
+        return None
+
+    def _eval(n):
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            return n.value
+        if isinstance(n, ast.BinOp) and type(n.op) in _SAFE_MATH_OPERATORS:
+            return _SAFE_MATH_OPERATORS[type(n.op)](_eval(n.left), _eval(n.right))
+        if isinstance(n, ast.UnaryOp) and type(n.op) in _SAFE_MATH_OPERATORS:
+            return _SAFE_MATH_OPERATORS[type(n.op)](_eval(n.operand))
+        raise ValueError("disallowed expression")
+
+    try:
+        return _eval(node)
+    except Exception:
+        return None
 
 
 CHOOM_WELCOME_LINES = [
@@ -1426,6 +1495,41 @@ async def on_message(message):
             embed.set_thumbnail(url=message.author.display_avatar.url)
             await message.channel.send(embed=embed)
 
+    # ---- Counting game ----
+    counting_config = get_counting_config(message.guild.id)
+    if counting_config and message.channel.id == counting_config[0]:
+        _, current_count, last_user_id = counting_config
+        content = message.content.strip()
+        if content.endswith("="):
+            content = content[:-1].strip()
+
+        value = None
+        try:
+            value = int(content)
+        except ValueError:
+            evaluated = safe_eval_math(content)
+            if evaluated is not None and float(evaluated).is_integer():
+                value = int(evaluated)
+
+        if value is not None:
+            if value == current_count and message.author.id != last_user_id:
+                try:
+                    await message.add_reaction("✅")
+                except discord.HTTPException:
+                    pass
+                update_counting_state(message.guild.id, current_count + 1, message.author.id)
+            else:
+                try:
+                    await message.add_reaction("❌")
+                except discord.HTTPException:
+                    pass
+                reason = "you can't count twice in a row" if value == current_count else f"the count was **{current_count}**"
+                await message.channel.send(embed=discord.Embed(
+                    description=f"💥 {message.author.mention} messed up — {reason}. Back to **1**!",
+                    color=COLOR_DANGER
+                ))
+                update_counting_state(message.guild.id, 1, None)
+
     await bot.process_commands(message)
 
 
@@ -1710,6 +1814,32 @@ async def kissstats(ctx, member1: discord.Member, member2: discord.Member = None
         color=COLOR_FUN
     )
     await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Set the channel for the counting game")
+@is_mod()
+async def setcountingchannel(ctx, channel: discord.TextChannel = None):
+    channel = channel or ctx.channel
+    set_counting_channel(ctx.guild.id, channel.id)
+    await ctx.send(embed=simple_embed(
+        f"✅ Counting game set up in {channel.mention}! Next number: **1**\n"
+        f"Math expressions work too (e.g. `4+9=` counts as 13).",
+        COLOR_SUCCESS
+    ))
+
+
+@bot.hybrid_command(description="Check the current count in the counting game")
+async def countingstatus(ctx):
+    config = get_counting_config(ctx.guild.id)
+    if not config:
+        await ctx.send(embed=simple_embed("No counting channel set up yet.", COLOR_WARNING))
+        return
+    channel_id, current_count, _ = config
+    channel = ctx.guild.get_channel(channel_id)
+    await ctx.send(embed=simple_embed(
+        f"🔢 Counting is active in {channel.mention if channel else 'an unknown channel'} — next number: **{current_count}**",
+        COLOR_PRIMARY
+    ))
 
 
 @bot.hybrid_command(description="Set the voice channel used for the Solitary Exile punishment")
