@@ -1841,10 +1841,34 @@ async def poke(ctx, member: discord.Member):
 async def bonk(ctx, member: discord.Member):
     embed = discord.Embed(description=f"{ctx.author.mention} bonks {member.mention}! 🔨", color=COLOR_FUN)
     try:
-        gif_url = await fetch_reaction_gif("bonk")
+        gif_url = await fetch_reaction_gif("smack")  # otakugifs has no "bonk"; "smack" is the closest match
         embed.set_image(url=gif_url)
     except Exception as e:
         print(f"Bonk gif error: {e}")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="kissfeet", description="Kiss someone's feet")
+async def kissfeet(ctx, member: discord.Member):
+    embed = discord.Embed(description=f"{ctx.author.mention} kisses {member.mention}'s feet 💋🦶", color=COLOR_FUN)
+    try:
+        # otakugifs has no dedicated feet reaction; "lick" is the closest playful match
+        gif_url = await fetch_reaction_gif("lick")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Kissfeet gif error: {e}")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Spank someone")
+async def spank(ctx, member: discord.Member):
+    embed = discord.Embed(description=f"{ctx.author.mention} spanks {member.mention}! 👋", color=COLOR_FUN)
+    try:
+        # otakugifs has no "spank"; "slap" / "smack" are the closest matches
+        gif_url = await fetch_reaction_gif("slap")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Spank gif error: {e}")
     await ctx.send(embed=embed)
 
 
@@ -1852,10 +1876,32 @@ async def bonk(ctx, member: discord.Member):
 async def highfive(ctx, member: discord.Member):
     embed = discord.Embed(description=f"{ctx.author.mention} high fives {member.mention}! ✋", color=COLOR_FUN)
     try:
-        gif_url = await fetch_reaction_gif("highfive")
+        gif_url = await fetch_reaction_gif("brofist")  # otakugifs has no "highfive"; "brofist" is the closest match
         embed.set_image(url=gif_url)
     except Exception as e:
         print(f"Highfive gif error: {e}")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Nuzzle someone")
+async def nuzzle(ctx, member: discord.Member):
+    embed = discord.Embed(description=f"{ctx.author.mention} nuzzles {member.mention} 🥺", color=COLOR_FUN)
+    try:
+        gif_url = await fetch_reaction_gif("nuzzle")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Nuzzle gif error: {e}")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Hold hands with someone")
+async def handhold(ctx, member: discord.Member):
+    embed = discord.Embed(description=f"{ctx.author.mention} holds hands with {member.mention} 🤝", color=COLOR_FUN)
+    try:
+        gif_url = await fetch_reaction_gif("handhold")
+        embed.set_image(url=gif_url)
+    except Exception as e:
+        print(f"Handhold gif error: {e}")
     await ctx.send(embed=embed)
 
 
