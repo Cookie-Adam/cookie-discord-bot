@@ -78,6 +78,15 @@ cursor.execute("""
     )
 """)
 cursor.execute("""
+    CREATE TABLE IF NOT EXISTS cuddle_counts (
+        user1_id INTEGER,
+        user2_id INTEGER,
+        guild_id INTEGER,
+        count INTEGER DEFAULT 0,
+        PRIMARY KEY (user1_id, user2_id, guild_id)
+    )
+""")
+cursor.execute("""
     CREATE TABLE IF NOT EXISTS welcome_config (
         guild_id INTEGER PRIMARY KEY,
         channel_id INTEGER
@@ -169,8 +178,7 @@ def simple_embed(description: str, color=COLOR_PRIMARY, title: str = None):
 
 def is_mod():
     async def predicate(ctx):
-        user_role_names = [role.name for role in ctx.author.roles]
-        if any(name in user_role_names for name in MOD_ROLE_NAMES):
+        if is_mod_member(ctx.author):
             return True
         await ctx.send(embed=simple_embed("🚫 You don't have permission to use this command.", COLOR_DANGER))
         return False
@@ -178,6 +186,11 @@ def is_mod():
 
 
 def is_mod_member(member: discord.Member) -> bool:
+    # Works in any server automatically: real Discord admin/kick permissions
+    # always count, PLUS these specific named roles for backward compatibility
+    # with servers (like The Chooms) that set them up manually.
+    if member.guild_permissions.administrator or member.guild_permissions.kick_members:
+        return True
     return any(role.name in MOD_ROLE_NAMES for role in member.roles)
 
 
@@ -217,6 +230,19 @@ def get_kiss_count(id_a: int, id_b: int, guild_id: int) -> int:
     cursor.execute("SELECT count FROM kiss_counts WHERE user1_id = ? AND user2_id = ? AND guild_id = ?", (u1, u2, guild_id))
     row = cursor.fetchone()
     return row[0] if row else 0
+
+
+def increment_cuddle_count(id_a: int, id_b: int, guild_id: int) -> int:
+    u1, u2 = min(id_a, id_b), max(id_a, id_b)
+    cursor.execute("SELECT count FROM cuddle_counts WHERE user1_id = ? AND user2_id = ? AND guild_id = ?", (u1, u2, guild_id))
+    row = cursor.fetchone()
+    new_count = (row[0] if row else 0) + 1
+    cursor.execute(
+        "INSERT OR REPLACE INTO cuddle_counts (user1_id, user2_id, guild_id, count) VALUES (?, ?, ?, ?)",
+        (u1, u2, guild_id, new_count),
+    )
+    db.commit()
+    return new_count
 
 
 def ordinal(n: int) -> str:
@@ -1767,17 +1793,73 @@ async def pet(ctx, member: discord.Member = None):
         await ctx.send(embed=simple_embed(f"{ctx.author.mention} is petting {member.mention} 🖐️", COLOR_FUN))
 
 
+class BackView(discord.ui.View):
+    """One-shot 'back' button; only the person who was targeted can press it."""
+
+    def __init__(self, kind: str, sender: discord.Member, target: discord.Member):
+        super().__init__(timeout=300)
+        self.kind = kind
+        self.sender = sender
+        self.target = target
+        self.message = None
+        self.children[0].label = f"{kind.capitalize()} back"
+        self.children[0].emoji = {"hug": "🤗", "kiss": "💋", "cuddle": "🥰"}[kind]
+
+    @discord.ui.button(style=discord.ButtonStyle.primary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.target.id:
+            await interaction.response.send_message(
+                f"Only {self.target.display_name} can press this one.", ephemeral=True
+            )
+            return
+
+        gid = interaction.guild.id
+        if self.kind == "hug":
+            count = increment_hug_count(self.sender.id, gid)
+            text = f"{self.target.mention} hugs {self.sender.mention} back 🤗"
+            footer = f"This is the {ordinal(count)} time {self.sender.display_name} has been hugged!"
+        elif self.kind == "kiss":
+            count = increment_kiss_count(self.target.id, self.sender.id, gid)
+            text = f"{self.target.mention} kisses {self.sender.mention} back 💋"
+            footer = f"{self.sender.display_name} and {self.target.display_name} have kissed {count} time{'s' if count != 1 else ''}!"
+        else:
+            count = increment_cuddle_count(self.target.id, self.sender.id, gid)
+            text = f"{self.target.mention} cuddles {self.sender.mention} back 🥰"
+            footer = f"{self.sender.display_name} and {self.target.display_name} have cuddled {count} time{'s' if count != 1 else ''}!"
+
+        embed = discord.Embed(description=text, color=COLOR_FUN)
+        try:
+            embed.set_image(url=await fetch_reaction_gif(self.kind))
+        except Exception as e:
+            print(f"{self.kind} back gif error: {e}")
+        embed.set_footer(text=footer)
+
+        button.disabled = True
+        self.stop()
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(embed=embed)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
 @bot.hybrid_command(description="Hug someone")
 async def hug(ctx, member: discord.Member):
     new_count = increment_hug_count(member.id, ctx.guild.id)
     embed = discord.Embed(description=f"{ctx.author.mention} hugs {member.mention} 🤗", color=COLOR_FUN)
     try:
-        gif_url = await fetch_reaction_gif("hug")
-        embed.set_image(url=gif_url)
+        embed.set_image(url=await fetch_reaction_gif("hug"))
     except Exception as e:
         print(f"Hug gif error: {e}")
     embed.set_footer(text=f"This is the {ordinal(new_count)} time {member.display_name} has been hugged!")
-    await ctx.send(embed=embed)
+    view = BackView("hug", ctx.author, member)
+    view.message = await ctx.send(embed=embed, view=view)
 
 
 @bot.hybrid_command(description="Kiss someone")
@@ -1785,12 +1867,12 @@ async def kiss(ctx, member: discord.Member):
     new_count = increment_kiss_count(ctx.author.id, member.id, ctx.guild.id)
     embed = discord.Embed(description=f"{ctx.author.mention} kisses {member.mention} 💋", color=COLOR_FUN)
     try:
-        gif_url = await fetch_reaction_gif("kiss")
-        embed.set_image(url=gif_url)
+        embed.set_image(url=await fetch_reaction_gif("kiss"))
     except Exception as e:
         print(f"Kiss gif error: {e}")
     embed.set_footer(text=f"{ctx.author.display_name} and {member.display_name} have kissed {new_count} time{'s' if new_count != 1 else ''}!")
-    await ctx.send(embed=embed)
+    view = BackView("kiss", ctx.author, member)
+    view.message = await ctx.send(embed=embed, view=view)
 
 
 @bot.hybrid_command(description="Tickle someone")
@@ -1817,13 +1899,51 @@ async def pat(ctx, member: discord.Member):
 
 @bot.hybrid_command(description="Cuddle someone")
 async def cuddle(ctx, member: discord.Member):
+    new_count = increment_cuddle_count(ctx.author.id, member.id, ctx.guild.id)
     embed = discord.Embed(description=f"{ctx.author.mention} cuddles up with {member.mention} 🥰", color=COLOR_FUN)
     try:
-        gif_url = await fetch_reaction_gif("cuddle")
-        embed.set_image(url=gif_url)
+        embed.set_image(url=await fetch_reaction_gif("cuddle"))
     except Exception as e:
         print(f"Cuddle gif error: {e}")
+    embed.set_footer(text=f"{ctx.author.display_name} and {member.display_name} have cuddled {new_count} time{'s' if new_count != 1 else ''}!")
+    view = BackView("cuddle", ctx.author, member)
+    view.message = await ctx.send(embed=embed, view=view)
+
+
+@bot.hybrid_command(description="Slap someone")
+async def slap(ctx, member: discord.Member):
+    embed = discord.Embed(description=f"{ctx.author.mention} slaps {member.mention} 👋", color=COLOR_FUN)
+    try:
+        embed.set_image(url=await fetch_reaction_gif("slap"))
+    except Exception as e:
+        print(f"Slap gif error: {e}")
     await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(description="Move everyone from one voice channel to another (mods only)")
+@is_mod()
+async def moveall(ctx, source: discord.VoiceChannel, destination: discord.VoiceChannel):
+    if source.id == destination.id:
+        await ctx.send(embed=simple_embed("Source and destination are the same channel.", COLOR_WARNING))
+        return
+    members = list(source.members)
+    if not members:
+        await ctx.send(embed=simple_embed(f"Nobody is in {source.mention}.", COLOR_WARNING))
+        return
+    await ctx.defer()
+    moved, failed = 0, 0
+    for m in members:
+        try:
+            await m.move_to(destination, reason=f"/moveall by {ctx.author}")
+            moved += 1
+        except Exception as e:
+            print(f"moveall error for {m}: {e}")
+            failed += 1
+        await asyncio.sleep(0.3)
+    msg = f"Moved **{moved}** member{'s' if moved != 1 else ''} from {source.mention} to {destination.mention} 🚚"
+    if failed:
+        msg += f"\n⚠️ Couldn't move {failed} (check my Move Members permission on both channels)."
+    await ctx.send(embed=simple_embed(msg, COLOR_SUCCESS))
 
 
 @bot.hybrid_command(description="Poke someone")
@@ -1845,30 +1965,6 @@ async def bonk(ctx, member: discord.Member):
         embed.set_image(url=gif_url)
     except Exception as e:
         print(f"Bonk gif error: {e}")
-    await ctx.send(embed=embed)
-
-
-@bot.hybrid_command(name="kissfeet", description="Kiss someone's feet")
-async def kissfeet(ctx, member: discord.Member):
-    embed = discord.Embed(description=f"{ctx.author.mention} kisses {member.mention}'s feet 💋🦶", color=COLOR_FUN)
-    try:
-        # otakugifs has no dedicated feet reaction; "lick" is the closest playful match
-        gif_url = await fetch_reaction_gif("lick")
-        embed.set_image(url=gif_url)
-    except Exception as e:
-        print(f"Kissfeet gif error: {e}")
-    await ctx.send(embed=embed)
-
-
-@bot.hybrid_command(description="Spank someone")
-async def spank(ctx, member: discord.Member):
-    embed = discord.Embed(description=f"{ctx.author.mention} spanks {member.mention}! 👋", color=COLOR_FUN)
-    try:
-        # otakugifs has no "spank"; "slap" / "smack" are the closest matches
-        gif_url = await fetch_reaction_gif("slap")
-        embed.set_image(url=gif_url)
-    except Exception as e:
-        print(f"Spank gif error: {e}")
     await ctx.send(embed=embed)
 
 
