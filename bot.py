@@ -1920,15 +1920,17 @@ async def slap(ctx, member: discord.Member):
     await ctx.send(embed=embed)
 
 
-@bot.hybrid_command(description="Move everyone from one voice channel to another (mods only)")
+@bot.hybrid_command(description="Move everyone in any voice channel to one destination (mods only)")
 @is_mod()
-async def moveall(ctx, source: discord.VoiceChannel, destination: discord.VoiceChannel):
-    if source.id == destination.id:
-        await ctx.send(embed=simple_embed("Source and destination are the same channel.", COLOR_WARNING))
-        return
-    members = list(source.members)
+async def moveall(ctx, destination: discord.VoiceChannel):
+    members = [
+        m
+        for vc in ctx.guild.voice_channels
+        if vc.id != destination.id
+        for m in vc.members
+    ]
     if not members:
-        await ctx.send(embed=simple_embed(f"Nobody is in {source.mention}.", COLOR_WARNING))
+        await ctx.send(embed=simple_embed("Nobody to move — no one is in another voice channel.", COLOR_WARNING))
         return
     await ctx.defer()
     moved, failed = 0, 0
@@ -1940,9 +1942,9 @@ async def moveall(ctx, source: discord.VoiceChannel, destination: discord.VoiceC
             print(f"moveall error for {m}: {e}")
             failed += 1
         await asyncio.sleep(0.3)
-    msg = f"Moved **{moved}** member{'s' if moved != 1 else ''} from {source.mention} to {destination.mention} 🚚"
+    msg = f"Moved **{moved}** member{'s' if moved != 1 else ''} to {destination.mention} 🚚"
     if failed:
-        msg += f"\n⚠️ Couldn't move {failed} (check my Move Members permission on both channels)."
+        msg += f"\n⚠️ Couldn't move {failed} (check my Move Members permission on those channels)."
     await ctx.send(embed=simple_embed(msg, COLOR_SUCCESS))
 
 
